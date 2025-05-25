@@ -1,7 +1,7 @@
 ﻿using System;
 using System.IO;
 using System.Linq;
-using System.Collections.Generic; // Required for List<string>
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -19,7 +19,7 @@ public class Program
         { GlobalFFOptions.Configure(new FFOptions { BinaryFolder = ffmpegBinFolder }); Console.WriteLine($"FFMpegCore: Configured from: {ffmpegBinFolder}"); }
         else { Console.Error.WriteLine($"FFMpegCore Error: ffmpeg_bin or executables not found at {ffmpegBinFolder}. Using PATH if available."); }
 
-        Console.WriteLine("\nReddit Video Maker Bot C# - Step 10.2: Enhanced Comment Cards"); // Updated step
+        Console.WriteLine("\nReddit Video Maker Bot C# - Step 10.2: Enhanced Comment Cards");
 
         IConfiguration configuration = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
@@ -89,7 +89,16 @@ public class Program
 
                 // Using CreateRedditContentCardAsync for the title, passing author and score
                 if (await ttsService.TextToSpeechAsync(selectedPost.Title!, titleTtsPath) &&
-                    await imageService.CreateRedditContentCardAsync(selectedPost.Title!, selectedPost.Author, selectedPost.Score, titleCardPath, videoOptions.CardWidth, videoOptions.CardHeight, videoOptions.CardBackgroundColor, videoOptions.CardFontColor, videoOptions.CardFontColor) && // Assuming metadata color same as main for title
+                    await imageService.CreateRedditContentCardAsync(
+                        selectedPost.Title!,
+                        selectedPost.Author,
+                        selectedPost.Score,
+                        titleCardPath,
+                        videoOptions.CardWidth,
+                        videoOptions.CardHeight,
+                        videoOptions.CardBackgroundColor,
+                        videoOptions.CardFontColor,
+                        videoOptions.CardMetadataFontColor) &&
                     await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath, titleCardPath, titleTtsPath, titleClipPath, finalVideoWidth, finalVideoHeight))
                 {
                     Console.WriteLine($"Title clip created: {titleClipPath}");
@@ -121,7 +130,16 @@ public class Program
 
                         // Using CreateRedditContentCardAsync for comments, passing author and score
                         if (await ttsService.TextToSpeechAsync(comment.Body!, cTtsPath) &&
-                            await imageService.CreateRedditContentCardAsync(comment.Body!, comment.Author, comment.Score, cCardPath, videoOptions.CardWidth, videoOptions.CardHeight, videoOptions.CardBackgroundColor, videoOptions.CardFontColor) &&
+                            await imageService.CreateRedditContentCardAsync(
+                                comment.Body!,
+                                comment.Author,
+                                comment.Score,
+                                cCardPath,
+                                videoOptions.CardWidth,
+                                videoOptions.CardHeight,
+                                videoOptions.CardBackgroundColor,
+                                videoOptions.CardFontColor,
+                                videoOptions.CardMetadataFontColor) &&
                             await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath, cCardPath, cTtsPath, cClipPath, finalVideoWidth, finalVideoHeight))
                         {
                             Console.WriteLine($"Comment clip {idx} created: {cClipPath}");

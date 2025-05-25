@@ -50,7 +50,7 @@ namespace RedditVideoMaker.Core
             if (_defaultFontFamily == null)
             {
                 Console.WriteLine("ImageService: Bundled font not loaded. Attempting to use system fonts as fallback.");
-                FontFamily systemFont; // Non-nullable for out parameter
+                FontFamily systemFont;
                 if (SystemFonts.TryGet("Arial", out systemFont)) _defaultFontFamily = systemFont;
                 else if (SystemFonts.TryGet("Verdana", out systemFont)) _defaultFontFamily = systemFont;
                 else if (SystemFonts.TryGet(ExpectedBundledFontFamilyName, out systemFont)) _defaultFontFamily = systemFont;
@@ -58,39 +58,24 @@ namespace RedditVideoMaker.Core
                 else if (SystemFonts.TryGet("Calibri", out systemFont)) _defaultFontFamily = systemFont;
                 else if (SystemFonts.Families.Any())
                 {
-                    FontFamily firstSystemFont = SystemFonts.Families.First(); // This is non-nullable
-                    _defaultFontFamily = firstSystemFont; // Assign non-nullable to nullable
+                    FontFamily firstSystemFont = SystemFonts.Families.First();
+                    _defaultFontFamily = firstSystemFont;
                     Console.WriteLine($"ImageService Warning: Using first available system font: {firstSystemFont.Name}.");
                 }
             }
 
-            // Corrected access to .Name after null check
             if (_defaultFontFamily != null)
             {
-                // Assign to a non-nullable local variable after the check, using an explicit cast
-                FontFamily confirmedFontFamily = (FontFamily)_defaultFontFamily; // Corrected for CS0266
+                FontFamily confirmedFontFamily = (FontFamily)_defaultFontFamily;
                 Console.WriteLine($"ImageService: Initialized. Using font: {confirmedFontFamily.Name}");
             }
             else { Console.Error.WriteLine("ImageService Critical: No font loaded. Text rendering will likely fail."); }
         }
 
-        /// <summary>
-        /// Creates an image (card) with the Reddit comment text, author, and score.
-        /// </summary>
-        /// <param name="mainText">The main comment body or post title.</param>
-        /// <param name="author">The author of the comment/post (e.g., "u/username").</param>
-        /// <param name="score">The score of the comment/post.</param>
-        /// <param name="outputImagePath">The path to save the generated image.</param>
-        /// <param name="cardWidth">Width of the output card image.</param>
-        /// <param name="cardHeight">Height of the output card image.</param>
-        /// <param name="backgroundColorString">Background color of the card.</param>
-        /// <param name="fontColorString">Main font color for the text.</param>
-        /// <param name="metadataFontColorString">Font color for author/score metadata.</param>
-        /// <returns>True if successful, false otherwise.</returns>
         public async Task<bool> CreateRedditContentCardAsync(
             string mainText,
-            string? author, // Author can be null or empty for titles sometimes
-            int? score,    // Score can be null
+            string? author,
+            int? score,
             string outputImagePath,
             int cardWidth,
             int cardHeight,
@@ -108,7 +93,7 @@ namespace RedditVideoMaker.Core
                 return false;
             }
 
-            FontFamily activeFontFamily = (FontFamily)_defaultFontFamily; // Corrected for CS0266. Explicit cast after null check.
+            FontFamily activeFontFamily = (FontFamily)_defaultFontFamily;
 
             try
             {
@@ -126,21 +111,22 @@ namespace RedditVideoMaker.Core
                 {
                     image.Mutate(ctx => ctx.BackgroundColor(backgroundColor));
 
-                    // --- Define Fonts ---
-                    float basePadding = Math.Max(10f, Math.Min(cardWidth * 0.05f, cardHeight * 0.05f));
-                    float metadataFontSize = CalculateFontSizeForCard(cardWidth, cardHeight, 20, 0.1f); // Smaller font for metadata
-                    Font metadataFont = activeFontFamily.CreateFont(metadataFontSize, FontStyle.Italic);
-
-                    float currentY = basePadding; // Starting Y position
+                    float basePadding = Math.Max(15f, Math.Min(cardWidth * 0.05f, cardHeight * 0.05f));
+                    float currentY = basePadding;
 
                     // --- Draw Author and Score ---
                     if (!string.IsNullOrWhiteSpace(author))
                     {
-                        string authorText = $"u/{author}";
+                        // Pass activeFontFamily (which is non-nullable) to CalculateFontSizeForLine
+                        float metadataFontSize = CalculateFontSizeForLine(activeFontFamily, cardWidth - (2 * basePadding), text: $"{author}{score}", maxLines: 1, cardHeight * 0.08f);
+                        Font metadataFont = activeFontFamily.CreateFont(metadataFontSize, FontStyle.Italic);
+
+                        string authorScoreText = $"u/{author}";
                         if (score.HasValue)
                         {
-                            authorText += $" • {score.Value} points";
+                            authorScoreText += $" • {score.Value} points";
                         }
+
                         var authorTextOptions = new RichTextOptions(metadataFont)
                         {
                             Origin = new PointF(basePadding, currentY),
@@ -149,30 +135,38 @@ namespace RedditVideoMaker.Core
                             WrappingLength = cardWidth - (2 * basePadding),
                             Dpi = 72f
                         };
-                        image.Mutate(ctx => ctx.DrawText(authorTextOptions, authorText, metadataFontColor));
-                        // Estimate height of metadata text (this is a rough estimate)
-                        FontRectangle authorBounds = TextMeasurer.MeasureBounds(authorText, authorTextOptions);
-                        currentY += authorBounds.Height + (basePadding / 2); // Add some spacing
+                        image.Mutate(ctx => ctx.DrawText(authorTextOptions, authorScoreText, metadataFontColor));
+
+                        FontRectangle authorBounds = TextMeasurer.MeasureBounds(authorScoreText, authorTextOptions);
+                        currentY += authorBounds.Height + basePadding * 0.75f;
                     }
 
                     // --- Draw Main Text ---
-                    // Adjust available height for main text based on metadata drawn
-                    float availableHeightForMainText = cardHeight - currentY - basePadding;
-                    float mainTextFontSize = CalculateFontSizeForCard(cardWidth, (int)availableHeightForMainText, mainText.Length, 0.9f); // Use more of available height
-                    Font mainFont = activeFontFamily.CreateFont(mainTextFontSize, FontStyle.Regular);
+                    float mainTextRegionWidth = cardWidth - (2 * basePadding);
+                    float mainTextRegionHeight = cardHeight - currentY - basePadding;
 
-                    var mainTextGraphicsOptions = new RichTextOptions(mainFont)
+                    if (mainTextRegionHeight > 20)
                     {
-                        Origin = new PointF(basePadding, currentY),
-                        HorizontalAlignment = HorizontalAlignment.Left,
-                        VerticalAlignment = VerticalAlignment.Top,
-                        WrappingLength = cardWidth - (2 * basePadding),
-                        LineSpacing = 1.2f,
-                        Dpi = 72f
-                    };
+                        float mainTextFontSize = CalculateFontSizeToFit(mainText, activeFontFamily, mainTextRegionWidth, mainTextRegionHeight);
+                        Font mainFont = activeFontFamily.CreateFont(mainTextFontSize, FontStyle.Regular);
 
-                    Console.WriteLine($"ImageService: Drawing text card ({cardWidth}x{cardHeight}), Main Font: {activeFontFamily.Name}, Size: {mainTextFontSize}pt");
-                    image.Mutate(ctx => ctx.DrawText(mainTextGraphicsOptions, mainText, mainFontColor));
+                        var mainTextGraphicsOptions = new RichTextOptions(mainFont)
+                        {
+                            Origin = new PointF(basePadding, currentY),
+                            HorizontalAlignment = HorizontalAlignment.Left,
+                            VerticalAlignment = VerticalAlignment.Top,
+                            WrappingLength = mainTextRegionWidth,
+                            LineSpacing = 1.2f,
+                            Dpi = 72f
+                        };
+
+                        Console.WriteLine($"ImageService: Drawing text card ({cardWidth}x{cardHeight}), Main Font: {activeFontFamily.Name}, Size: {mainTextFontSize}pt");
+                        image.Mutate(ctx => ctx.DrawText(mainTextGraphicsOptions, mainText, mainFontColor));
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine("ImageService Warning: Not enough space to render main text after metadata.");
+                    }
 
                     await image.SaveAsPngAsync(outputImagePath);
                     Console.WriteLine($"ImageService: Text card saved to {outputImagePath}");
@@ -187,20 +181,55 @@ namespace RedditVideoMaker.Core
             }
         }
 
-        private float CalculateFontSizeForCard(int boxWidth, int boxHeight, int textLength, float targetFillFactor = 0.7f)
+        // Calculates font size for a single line of text to fit width, clamped by maxHeight.
+        // Now takes a non-nullable FontFamily.
+        private float CalculateFontSizeForLine(FontFamily fontFamily, float regionWidth, string text, int maxLines, float maxHeightAbsolute)
         {
-            if (textLength == 0 || boxHeight <= 0 || boxWidth <= 0) return 10f;
+            if (string.IsNullOrEmpty(text) || regionWidth <= 0 || maxHeightAbsolute <= 0) return 10f;
 
-            float referenceDimension = Math.Min(boxWidth, boxHeight);
-            float availableHeight = boxHeight * targetFillFactor;
+            float fontSize = maxHeightAbsolute / maxLines;
+            Font testFont = fontFamily.CreateFont(fontSize);
+            FontRectangle textSize = TextMeasurer.MeasureBounds(text, new RichTextOptions(testFont) { WrappingLength = regionWidth });
 
-            // Attempt to make font size proportional to available height and inversely to sqrt of text length (more text = smaller font)
-            // This is a heuristic and can be refined.
-            float fontSize = (float)(availableHeight / (Math.Sqrt(textLength / 10.0) + 1.0)); // Reduce impact of length slightly
-            fontSize = Math.Max(8f, fontSize); // Ensure a minimum font size
+            while ((textSize.Width > regionWidth || textSize.Height > maxHeightAbsolute) && fontSize > 8f)
+            {
+                fontSize -= 1f;
+                if (fontSize <= 8f) break;
+                testFont = fontFamily.CreateFont(fontSize);
+                textSize = TextMeasurer.MeasureBounds(text, new RichTextOptions(testFont) { WrappingLength = regionWidth });
+            }
+            return Math.Max(8f, fontSize);
+        }
 
-            // Clamp font size to reasonable min/max values relative to card height/width
-            return Math.Clamp(fontSize, referenceDimension / 40f, referenceDimension / 5f);
+        // Tries to find a font size that fits the text within the given box dimensions.
+        private float CalculateFontSizeToFit(string text, FontFamily fontFamily, float regionWidth, float regionHeight, float lineSpacing = 1.2f)
+        {
+            if (string.IsNullOrEmpty(text) || regionWidth <= 10 || regionHeight <= 10) return 8f;
+
+            float maxFontSize = regionHeight / lineSpacing;
+            float minFontSize = 8f;
+            float currentFontSize = maxFontSize;
+
+            for (int i = 0; i < 15; i++)
+            {
+                if (currentFontSize < minFontSize) currentFontSize = minFontSize;
+                Font testFont = fontFamily.CreateFont(currentFontSize, FontStyle.Regular);
+                var textOptions = new RichTextOptions(testFont)
+                {
+                    WrappingLength = regionWidth,
+                    LineSpacing = lineSpacing,
+                    Dpi = 72f
+                };
+                FontRectangle bounds = TextMeasurer.MeasureBounds(text, textOptions);
+
+                if (bounds.Height <= regionHeight && bounds.Width <= regionWidth)
+                {
+                    break;
+                }
+                currentFontSize -= Math.Max(1f, currentFontSize * 0.1f);
+                if (currentFontSize < minFontSize) break;
+            }
+            return Math.Max(minFontSize, currentFontSize);
         }
     }
 }
