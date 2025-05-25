@@ -18,12 +18,14 @@ namespace RedditVideoMaker.Core
         public bool EnableTransitions { get; set; } = true;
         public double TransitionDurationSeconds { get; set; } = 0.5;
 
-        // New properties for Step 16.1: Configurable Font Sizes
         public float ContentTargetFontSize { get; set; } = 36f;
         public float ContentMinFontSize { get; set; } = 16f;
         public float ContentMaxFontSize { get; set; } = 60f;
         public float MetadataTargetFontSize { get; set; } = 24f;
         public float MetadataMinFontSize { get; set; } = 12f;
         public float MetadataMaxFontSize { get; set; } = 32f;
+
+        // New property for Step 17: Cleanup
+        public bool CleanUpIntermediateFiles { get; set; } = true; // Default to true
     }
 }

@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using RedditVideoMaker.Core;
 using FFMpegCore;
+using SixLabors.Fonts; // Required for FontFamily and Font for TextUtilities
 
 public class Program
 {
@@ -19,7 +20,7 @@ public class Program
         { GlobalFFOptions.Configure(new FFOptions { BinaryFolder = ffmpegBinFolder }); Console.WriteLine($"FFMpegCore: Configured from: {ffmpegBinFolder}"); }
         else { Console.Error.WriteLine($"FFMpegCore Error: ffmpeg_bin or executables not found at {ffmpegBinFolder}. Using PATH if available."); }
 
-        Console.WriteLine("\nReddit Video Maker Bot C# - Step 16.1: Configurable Font Sizes");
+        Console.WriteLine("\nReddit Video Maker Bot C# - Step 16.2: Handling Long Self-Texts");
 
         IConfiguration configuration = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
@@ -31,7 +32,6 @@ public class Program
         services.Configure<VideoOptions>(configuration.GetSection(VideoOptions.SectionName));
         services.AddSingleton<RedditService>();
         services.AddSingleton<TtsService>();
-        // ImageService now depends on IOptions<VideoOptions>, DI will handle it
         services.AddSingleton<ImageService>();
         services.AddSingleton<VideoService>();
         var serviceProvider = services.BuildServiceProvider();
@@ -83,6 +83,29 @@ public class Program
                 Console.WriteLine($"Font Sizes (Content Target/Min/Max): {videoOptions.ContentTargetFontSize}/{videoOptions.ContentMinFontSize}/{videoOptions.ContentMaxFontSize}");
                 Console.WriteLine($"Font Sizes (Metadata Target/Min/Max): {videoOptions.MetadataTargetFontSize}/{videoOptions.MetadataMinFontSize}/{videoOptions.MetadataMaxFontSize}");
 
+                // --- Font setup for text splitting ---
+                FontFamily? nullableMeasuringFontFamily = null;
+                if (SystemFonts.TryGet("DejaVu Sans", out FontFamily dejavu))
+                {
+                    nullableMeasuringFontFamily = dejavu;
+                    Console.WriteLine("Program.cs: Using 'DejaVu Sans' for text measurement.");
+                }
+                else if (SystemFonts.Families.Any()) // Check if any families exist before calling FirstOrDefault
+                {
+                    FontFamily firstSystemFont = SystemFonts.Families.First(); // This should be a valid one
+                    // Check if the obtained font family is valid (e.g., has a name)
+                    if (!string.IsNullOrEmpty(firstSystemFont.Name))
+                    {
+                        nullableMeasuringFontFamily = firstSystemFont;
+                        Console.WriteLine($"Program.cs: Warning - 'DejaVu Sans' not found. Using first available system font '{firstSystemFont.Name}' for text measurement.");
+                    }
+                }
+
+                if (nullableMeasuringFontFamily == null) // This check now means no valid font was found
+                {
+                    Console.Error.WriteLine("Program.cs: Critical - No usable system font found for text measurement. Self-text splitting might be inaccurate or skipped.");
+                }
+
 
                 // --- Process Post Title as a Clip ---
                 Console.WriteLine($"\n--- Processing Post Title ---");
@@ -91,51 +114,77 @@ public class Program
                 string titleCardPath = Path.Combine(imgDir, $"image_{titleId}.png");
                 string titleClipPath = Path.Combine(clipsDir, $"clip_{titleId}.mp4");
 
-                // ImageService will use configured font sizes internally via its injected VideoOptions
                 if (await ttsService.TextToSpeechAsync(selectedPost.Title!, titleTtsPath) &&
                     await imageService.CreateRedditContentCardAsync(
-                        selectedPost.Title!,
-                        selectedPost.Author,
-                        selectedPost.Score,
-                        titleCardPath,
-                        videoOptions.CardWidth,
-                        videoOptions.CardHeight,
-                        videoOptions.CardBackgroundColor,
-                        videoOptions.CardFontColor,
-                        videoOptions.CardMetadataFontColor) &&
-                    await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath, titleCardPath, titleTtsPath, titleClipPath, finalVideoWidth, finalVideoHeight))
+                        selectedPost.Title!, selectedPost.Author, selectedPost.Score, titleCardPath,
+                        videoOptions.CardWidth, videoOptions.CardHeight, videoOptions.CardBackgroundColor,
+                        videoOptions.CardFontColor, videoOptions.CardMetadataFontColor) &&
+                    await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath!, titleCardPath, titleTtsPath, titleClipPath, finalVideoWidth, finalVideoHeight))
                 {
                     Console.WriteLine($"Title clip created: {titleClipPath}");
                     individualVideoClips.Add(titleClipPath);
                 }
                 else { Console.Error.WriteLine("Failed to process title clip."); }
 
-                // --- Process Post Self-Text as a Clip (if it exists) ---
-                if (!string.IsNullOrWhiteSpace(selectedPost.Selftext))
+                // --- Process Post Self-Text as a Clip (with splitting) ---
+                if (!string.IsNullOrWhiteSpace(selectedPost.Selftext) && nullableMeasuringFontFamily != null)
                 {
-                    Console.WriteLine($"\n--- Processing Post Self-Text ---");
-                    string selfTextId = $"post_{selectedPost.Id!}_selftext";
-                    string selfTextTtsPath = Path.Combine(ttsDir, $"audio_{selfTextId}.wav");
-                    string selfTextCardPath = Path.Combine(imgDir, $"image_{selfTextId}.png");
-                    string selfTextClipPath = Path.Combine(clipsDir, $"clip_{selfTextId}.mp4");
+                    Console.WriteLine($"\n--- Processing Post Self-Text (with splitting if needed) ---");
 
-                    if (await ttsService.TextToSpeechAsync(selectedPost.Selftext, selfTextTtsPath) &&
-                        await imageService.CreateRedditContentCardAsync( // ImageService will use configured font sizes
-                            selectedPost.Selftext,
-                            null,
-                            null,
-                            selfTextCardPath,
-                            videoOptions.CardWidth,
-                            videoOptions.CardHeight,
-                            videoOptions.CardBackgroundColor,
-                            videoOptions.CardFontColor,
-                            videoOptions.CardMetadataFontColor) &&
-                        await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath, selfTextCardPath, selfTextTtsPath, selfTextClipPath, finalVideoWidth, finalVideoHeight))
+                    FontFamily actualMeasuringFontFamily = (FontFamily)nullableMeasuringFontFamily; // Cast is safe here due to the null check
+                    Font selfTextMeasuringFont = actualMeasuringFontFamily.CreateFont(videoOptions.ContentTargetFontSize, FontStyle.Regular);
+
+                    float textPadding = Math.Max(15f, Math.Min(videoOptions.CardWidth * 0.05f, videoOptions.CardHeight * 0.05f));
+                    float selfTextCardContentWidth = videoOptions.CardWidth - (2 * textPadding);
+                    float selfTextCardContentHeight = videoOptions.CardHeight - (2 * textPadding);
+
+                    List<string> selfTextPages = TextUtilities.SplitTextIntoPages(
+                        selectedPost.Selftext,
+                        selfTextMeasuringFont,
+                        selfTextCardContentWidth,
+                        selfTextCardContentHeight);
+
+                    Console.WriteLine($"Self-text split into {selfTextPages.Count} page(s).");
+                    int selfTextPageIndex = 0;
+                    foreach (string selfTextPage in selfTextPages)
                     {
-                        Console.WriteLine($"Self-text clip created: {selfTextClipPath}");
-                        individualVideoClips.Add(selfTextClipPath);
+                        if (string.IsNullOrWhiteSpace(selfTextPage)) continue;
+
+                        selfTextPageIndex++;
+                        Console.WriteLine($"-- Processing self-text page {selfTextPageIndex} --");
+                        string selfTextId = $"post_{selectedPost.Id!}_selftext_p{selfTextPageIndex}";
+                        string selfTextTtsPath = Path.Combine(ttsDir, $"audio_{selfTextId}.wav");
+                        string selfTextCardPath = Path.Combine(imgDir, $"image_{selfTextId}.png");
+                        string selfTextClipPath = Path.Combine(clipsDir, $"clip_{selfTextId}.mp4");
+
+                        string pageIndicator = selfTextPages.Count > 1 ? $" (Page {selfTextPageIndex}/{selfTextPages.Count})" : "";
+
+                        if (await ttsService.TextToSpeechAsync(selfTextPage, selfTextTtsPath) &&
+                            await imageService.CreateRedditContentCardAsync(
+                                selfTextPage + pageIndicator,
+                                null,
+                                null,
+                                selfTextCardPath,
+                                videoOptions.CardWidth,
+                                videoOptions.CardHeight,
+                                videoOptions.CardBackgroundColor,
+                                videoOptions.CardFontColor,
+                                videoOptions.CardMetadataFontColor) &&
+                            await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath!, selfTextCardPath, selfTextTtsPath, selfTextClipPath, finalVideoWidth, finalVideoHeight))
+                        {
+                            Console.WriteLine($"Self-text clip (page {selfTextPageIndex}) created: {selfTextClipPath}");
+                            individualVideoClips.Add(selfTextClipPath);
+                        }
+                        else { Console.Error.WriteLine($"Failed to process self-text clip (page {selfTextPageIndex})."); }
                     }
-                    else { Console.Error.WriteLine("Failed to process self-text clip."); }
+                }
+                else if (string.IsNullOrWhiteSpace(selectedPost.Selftext))
+                {
+                    Console.WriteLine("No self-text for this post.");
+                }
+                else if (nullableMeasuringFontFamily == null)
+                {
+                    Console.Error.WriteLine("Skipping self-text processing as no usable measuring font was available.");
                 }
 
 
@@ -161,7 +210,7 @@ public class Program
                         string cClipPath = Path.Combine(clipsDir, $"clip_{cId}.mp4");
 
                         if (await ttsService.TextToSpeechAsync(comment.Body!, cTtsPath) &&
-                            await imageService.CreateRedditContentCardAsync( // ImageService will use configured font sizes
+                            await imageService.CreateRedditContentCardAsync(
                                 comment.Body!,
                                 comment.Author,
                                 comment.Score,
@@ -171,7 +220,7 @@ public class Program
                                 videoOptions.CardBackgroundColor,
                                 videoOptions.CardFontColor,
                                 videoOptions.CardMetadataFontColor) &&
-                            await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath, cCardPath, cTtsPath, cClipPath, finalVideoWidth, finalVideoHeight))
+                            await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath!, cCardPath, cTtsPath, cClipPath, finalVideoWidth, finalVideoHeight))
                         {
                             Console.WriteLine($"Comment clip {idx} created: {cClipPath}");
                             individualVideoClips.Add(cClipPath);
@@ -195,7 +244,7 @@ public class Program
         }
         else { Console.WriteLine($"No top posts found in /r/{redditOptions.Subreddit}."); }
 
-        Console.WriteLine("\nEnd of Step 16.1. Press any key to exit.");
+        Console.WriteLine("\nEnd of Step 16.2. Press any key to exit.");
         Console.ReadKey();
     }
 }
