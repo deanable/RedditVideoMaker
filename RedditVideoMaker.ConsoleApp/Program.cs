@@ -19,7 +19,7 @@ public class Program
         { GlobalFFOptions.Configure(new FFOptions { BinaryFolder = ffmpegBinFolder }); Console.WriteLine($"FFMpegCore: Configured from: {ffmpegBinFolder}"); }
         else { Console.Error.WriteLine($"FFMpegCore Error: ffmpeg_bin or executables not found at {ffmpegBinFolder}. Using PATH if available."); }
 
-        Console.WriteLine("\nReddit Video Maker Bot C# - Step 10.2: Enhanced Comment Cards");
+        Console.WriteLine("\nReddit Video Maker Bot C# - Step 16.1: Configurable Font Sizes");
 
         IConfiguration configuration = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
@@ -31,6 +31,7 @@ public class Program
         services.Configure<VideoOptions>(configuration.GetSection(VideoOptions.SectionName));
         services.AddSingleton<RedditService>();
         services.AddSingleton<TtsService>();
+        // ImageService now depends on IOptions<VideoOptions>, DI will handle it
         services.AddSingleton<ImageService>();
         services.AddSingleton<VideoService>();
         var serviceProvider = services.BuildServiceProvider();
@@ -78,6 +79,9 @@ public class Program
                 Console.WriteLine($"Using final video dimensions: {finalVideoWidth}x{finalVideoHeight}");
                 Console.WriteLine($"Using card dimensions: {videoOptions.CardWidth}x{videoOptions.CardHeight}");
                 Console.WriteLine($"Number of comments to include: {videoOptions.NumberOfCommentsToInclude}");
+                Console.WriteLine($"Transitions Enabled: {videoOptions.EnableTransitions}, Duration: {videoOptions.TransitionDurationSeconds}s");
+                Console.WriteLine($"Font Sizes (Content Target/Min/Max): {videoOptions.ContentTargetFontSize}/{videoOptions.ContentMinFontSize}/{videoOptions.ContentMaxFontSize}");
+                Console.WriteLine($"Font Sizes (Metadata Target/Min/Max): {videoOptions.MetadataTargetFontSize}/{videoOptions.MetadataMinFontSize}/{videoOptions.MetadataMaxFontSize}");
 
 
                 // --- Process Post Title as a Clip ---
@@ -87,7 +91,7 @@ public class Program
                 string titleCardPath = Path.Combine(imgDir, $"image_{titleId}.png");
                 string titleClipPath = Path.Combine(clipsDir, $"clip_{titleId}.mp4");
 
-                // Using CreateRedditContentCardAsync for the title, passing author and score
+                // ImageService will use configured font sizes internally via its injected VideoOptions
                 if (await ttsService.TextToSpeechAsync(selectedPost.Title!, titleTtsPath) &&
                     await imageService.CreateRedditContentCardAsync(
                         selectedPost.Title!,
@@ -105,6 +109,34 @@ public class Program
                     individualVideoClips.Add(titleClipPath);
                 }
                 else { Console.Error.WriteLine("Failed to process title clip."); }
+
+                // --- Process Post Self-Text as a Clip (if it exists) ---
+                if (!string.IsNullOrWhiteSpace(selectedPost.Selftext))
+                {
+                    Console.WriteLine($"\n--- Processing Post Self-Text ---");
+                    string selfTextId = $"post_{selectedPost.Id!}_selftext";
+                    string selfTextTtsPath = Path.Combine(ttsDir, $"audio_{selfTextId}.wav");
+                    string selfTextCardPath = Path.Combine(imgDir, $"image_{selfTextId}.png");
+                    string selfTextClipPath = Path.Combine(clipsDir, $"clip_{selfTextId}.mp4");
+
+                    if (await ttsService.TextToSpeechAsync(selectedPost.Selftext, selfTextTtsPath) &&
+                        await imageService.CreateRedditContentCardAsync( // ImageService will use configured font sizes
+                            selectedPost.Selftext,
+                            null,
+                            null,
+                            selfTextCardPath,
+                            videoOptions.CardWidth,
+                            videoOptions.CardHeight,
+                            videoOptions.CardBackgroundColor,
+                            videoOptions.CardFontColor,
+                            videoOptions.CardMetadataFontColor) &&
+                        await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath, selfTextCardPath, selfTextTtsPath, selfTextClipPath, finalVideoWidth, finalVideoHeight))
+                    {
+                        Console.WriteLine($"Self-text clip created: {selfTextClipPath}");
+                        individualVideoClips.Add(selfTextClipPath);
+                    }
+                    else { Console.Error.WriteLine("Failed to process self-text clip."); }
+                }
 
 
                 // --- Process Comments as Clips ---
@@ -128,9 +160,8 @@ public class Program
                         string cCardPath = Path.Combine(imgDir, $"image_{cId}.png");
                         string cClipPath = Path.Combine(clipsDir, $"clip_{cId}.mp4");
 
-                        // Using CreateRedditContentCardAsync for comments, passing author and score
                         if (await ttsService.TextToSpeechAsync(comment.Body!, cTtsPath) &&
-                            await imageService.CreateRedditContentCardAsync(
+                            await imageService.CreateRedditContentCardAsync( // ImageService will use configured font sizes
                                 comment.Body!,
                                 comment.Author,
                                 comment.Score,
@@ -164,7 +195,7 @@ public class Program
         }
         else { Console.WriteLine($"No top posts found in /r/{redditOptions.Subreddit}."); }
 
-        Console.WriteLine("\nEnd of Step 10.2. Press any key to exit.");
+        Console.WriteLine("\nEnd of Step 16.1. Press any key to exit.");
         Console.ReadKey();
     }
 }

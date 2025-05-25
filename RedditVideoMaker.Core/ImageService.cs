@@ -8,6 +8,7 @@ using SixLabors.ImageSharp.Processing;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Drawing.Processing;
 using SixLabors.Fonts;
+using Microsoft.Extensions.Options; // Required for IOptions
 
 namespace RedditVideoMaker.Core
 {
@@ -15,11 +16,14 @@ namespace RedditVideoMaker.Core
     {
         private readonly FontCollection _fontCollection;
         private readonly FontFamily? _defaultFontFamily;
+        private readonly VideoOptions _videoOptions; // To store video options including font sizes
         private const string BundledFontFileName = "DejaVuSans.ttf";
         private const string ExpectedBundledFontFamilyName = "DejaVu Sans";
 
-        public ImageService()
+        public ImageService(IOptions<VideoOptions> videoOptions) // Inject VideoOptions
         {
+            _videoOptions = videoOptions.Value; // Store the options
+
             _fontCollection = new FontCollection();
             FontFamily? loadedFont = null;
             try
@@ -117,8 +121,14 @@ namespace RedditVideoMaker.Core
                     // --- Draw Author and Score ---
                     if (!string.IsNullOrWhiteSpace(author))
                     {
-                        // Pass activeFontFamily (which is non-nullable) to CalculateFontSizeForLine
-                        float metadataFontSize = CalculateFontSizeForLine(activeFontFamily, cardWidth - (2 * basePadding), text: $"{author}{score}", maxLines: 1, cardHeight * 0.08f);
+                        float metadataFontSize = CalculateFontSizeForLine(
+                            activeFontFamily,
+                            cardWidth - (2 * basePadding),
+                            text: $"{author}{score}", // Text used for sizing estimation
+                            _videoOptions.MetadataTargetFontSize,
+                            _videoOptions.MetadataMinFontSize,
+                            _videoOptions.MetadataMaxFontSize,
+                            maxLines: 2); // Allow metadata to wrap to 2 lines if necessary
                         Font metadataFont = activeFontFamily.CreateFont(metadataFontSize, FontStyle.Italic);
 
                         string authorScoreText = $"u/{author}";
@@ -147,7 +157,14 @@ namespace RedditVideoMaker.Core
 
                     if (mainTextRegionHeight > 20)
                     {
-                        float mainTextFontSize = CalculateFontSizeToFit(mainText, activeFontFamily, mainTextRegionWidth, mainTextRegionHeight);
+                        float mainTextFontSize = CalculateFontSizeToFit(
+                            mainText,
+                            activeFontFamily,
+                            mainTextRegionWidth,
+                            mainTextRegionHeight,
+                            _videoOptions.ContentTargetFontSize,
+                            _videoOptions.ContentMinFontSize,
+                            _videoOptions.ContentMaxFontSize);
                         Font mainFont = activeFontFamily.CreateFont(mainTextFontSize, FontStyle.Regular);
 
                         var mainTextGraphicsOptions = new RichTextOptions(mainFont)
@@ -160,7 +177,7 @@ namespace RedditVideoMaker.Core
                             Dpi = 72f
                         };
 
-                        Console.WriteLine($"ImageService: Drawing text card ({cardWidth}x{cardHeight}), Main Font: {activeFontFamily.Name}, Size: {mainTextFontSize}pt");
+                        Console.WriteLine($"ImageService: Drawing text card ({cardWidth}x{cardHeight}), Main Font: {activeFontFamily.Name}, Size: {mainTextFontSize}pt (Target: {_videoOptions.ContentTargetFontSize}pt)");
                         image.Mutate(ctx => ctx.DrawText(mainTextGraphicsOptions, mainText, mainFontColor));
                     }
                     else
@@ -181,39 +198,65 @@ namespace RedditVideoMaker.Core
             }
         }
 
-        // Calculates font size for a single line of text to fit width, clamped by maxHeight.
-        // Now takes a non-nullable FontFamily.
-        private float CalculateFontSizeForLine(FontFamily fontFamily, float regionWidth, string text, int maxLines, float maxHeightAbsolute)
+        private float CalculateFontSizeForLine(FontFamily fontFamily, float regionWidth, string text,
+            float targetSize, float minSize, float maxSize, int maxLines = 1, float lineSpacing = 1.2f)
         {
-            if (string.IsNullOrEmpty(text) || regionWidth <= 0 || maxHeightAbsolute <= 0) return 10f;
+            if (string.IsNullOrEmpty(text) || regionWidth <= 0 || targetSize <= 0) return Math.Clamp(minSize, 8f, maxSize);
 
-            float fontSize = maxHeightAbsolute / maxLines;
-            Font testFont = fontFamily.CreateFont(fontSize);
-            FontRectangle textSize = TextMeasurer.MeasureBounds(text, new RichTextOptions(testFont) { WrappingLength = regionWidth });
+            float currentFontSize = Math.Clamp(targetSize, minSize, maxSize);
 
-            while ((textSize.Width > regionWidth || textSize.Height > maxHeightAbsolute) && fontSize > 8f)
+            for (int i = 0; i < 10; i++) // Limit iterations
             {
-                fontSize -= 1f;
-                if (fontSize <= 8f) break;
-                testFont = fontFamily.CreateFont(fontSize);
-                textSize = TextMeasurer.MeasureBounds(text, new RichTextOptions(testFont) { WrappingLength = regionWidth });
+                Font testFont = fontFamily.CreateFont(currentFontSize);
+                var textOptions = new RichTextOptions(testFont)
+                {
+                    WrappingLength = regionWidth,
+                    LineSpacing = lineSpacing, // Consider line spacing if maxLines > 1
+                    Dpi = 72f
+                };
+                FontRectangle textSize = TextMeasurer.MeasureBounds(text, textOptions);
+
+                // Calculate number of lines based on wrapped height
+                float actualLines = (textSize.Height / (currentFontSize * lineSpacing));
+
+                if (textSize.Width <= regionWidth && actualLines <= maxLines)
+                {
+                    // Fits, try to optimize towards target or max if current is smaller
+                    if (currentFontSize < targetSize && currentFontSize < maxSize)
+                    {
+                        float potentialSize = currentFontSize + 1f;
+                        testFont = fontFamily.CreateFont(potentialSize);
+                        textOptions.Font = testFont; // Update font in options for next measurement
+                        textSize = TextMeasurer.MeasureBounds(text, textOptions);
+                        actualLines = (textSize.Height / (potentialSize * lineSpacing));
+                        if (textSize.Width <= regionWidth && actualLines <= maxLines)
+                        {
+                            currentFontSize = potentialSize; // It still fits, so use larger
+                            continue; // Try to grow more if possible
+                        }
+                        // else, previous size was better
+                    }
+                    break; // Found a good fit or best possible enlargement
+                }
+
+                // If it doesn't fit, reduce size
+                if (currentFontSize <= minSize) break; // Already at min
+                currentFontSize = Math.Max(minSize, currentFontSize - 1f);
             }
-            return Math.Max(8f, fontSize);
+            return Math.Clamp(currentFontSize, minSize, maxSize);
         }
 
-        // Tries to find a font size that fits the text within the given box dimensions.
-        private float CalculateFontSizeToFit(string text, FontFamily fontFamily, float regionWidth, float regionHeight, float lineSpacing = 1.2f)
+        private float CalculateFontSizeToFit(string text, FontFamily fontFamily, float regionWidth, float regionHeight,
+            float targetSize, float minSize, float maxSize, float lineSpacing = 1.2f)
         {
-            if (string.IsNullOrEmpty(text) || regionWidth <= 10 || regionHeight <= 10) return 8f;
+            if (string.IsNullOrEmpty(text) || regionWidth <= 10 || regionHeight <= 10) return Math.Clamp(minSize, 8f, maxSize);
 
-            float maxFontSize = regionHeight / lineSpacing;
-            float minFontSize = 8f;
-            float currentFontSize = maxFontSize;
+            float currentFontSize = Math.Clamp(targetSize, minSize, maxSize); // Start with target, clamped by min/max
 
-            for (int i = 0; i < 15; i++)
+            // Iteratively adjust font size
+            for (int i = 0; i < 20; i++) // Limit iterations
             {
-                if (currentFontSize < minFontSize) currentFontSize = minFontSize;
-                Font testFont = fontFamily.CreateFont(currentFontSize, FontStyle.Regular);
+                Font testFont = fontFamily.CreateFont(currentFontSize);
                 var textOptions = new RichTextOptions(testFont)
                 {
                     WrappingLength = regionWidth,
@@ -222,14 +265,37 @@ namespace RedditVideoMaker.Core
                 };
                 FontRectangle bounds = TextMeasurer.MeasureBounds(text, textOptions);
 
-                if (bounds.Height <= regionHeight && bounds.Width <= regionWidth)
+                if (bounds.Height <= regionHeight && bounds.Width <= regionWidth) // It fits
                 {
+                    // If we started at target and it fits, this is good.
+                    // If we want to try to grow it towards max, we could add a small loop here.
+                    // For simplicity, if it fits when starting at target (or shrunk to fit), we accept.
+                    // If current size is below target, and target itself would fit, prefer target.
+                    if (currentFontSize < targetSize)
+                    {
+                        Font targetFont = fontFamily.CreateFont(targetSize);
+                        var targetOptions = new RichTextOptions(targetFont) { WrappingLength = regionWidth, LineSpacing = lineSpacing, Dpi = 72f };
+                        FontRectangle targetBounds = TextMeasurer.MeasureBounds(text, targetOptions);
+                        if (targetBounds.Height <= regionHeight && targetBounds.Width <= regionWidth)
+                        {
+                            currentFontSize = targetSize; // Prefer target if it fits
+                        }
+                    }
                     break;
                 }
-                currentFontSize -= Math.Max(1f, currentFontSize * 0.1f);
-                if (currentFontSize < minFontSize) break;
+
+                if (currentFontSize <= minSize) break; // Already at min and doesn't fit
+
+                // Reduce font size: more aggressively if far from fitting
+                float heightRatio = bounds.Height / regionHeight;
+                float reductionStep = 1f;
+                if (heightRatio > 1.5) reductionStep = currentFontSize * 0.2f; // Reduce by 20% if way too tall
+                else if (heightRatio > 1.1) reductionStep = currentFontSize * 0.1f; // Reduce by 10%
+
+                currentFontSize = Math.Max(minSize, currentFontSize - reductionStep);
+                if (currentFontSize < minSize) currentFontSize = minSize; // Ensure it doesn't go below min
             }
-            return Math.Max(minFontSize, currentFontSize);
+            return Math.Clamp(currentFontSize, minSize, maxSize);
         }
     }
 }
