@@ -19,16 +19,9 @@
 
   <ItemGroup>
     <Folder Include="Fonts\" />
-    <Folder Include="ffmpeg_bin\" />
   </ItemGroup>
 
   <ItemGroup>
-    <None Update="ffmpeg_bin\ffmpeg.exe">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-    <None Update="ffmpeg_bin\ffprobe.exe">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
     <None Update="Fonts\DejaVuSans.ttf">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
