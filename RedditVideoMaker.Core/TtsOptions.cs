@@ -15,5 +15,12 @@ namespace RedditVideoMaker.Core
         public string? AzureSpeechKey { get; set; }
         public string? AzureSpeechRegion { get; set; }
         public string? AzureVoiceName { get; set; } // Optional: e.g., "en-US-JennyNeural"
+
+        // Google Cloud TTS Options
+        public string? GoogleCloudCredentialsPath { get; set; } // Path to the JSON key file
+        public string? GoogleCloudVoiceName { get; set; } // Optional: e.g., "en-US-Wavenet-D"
+        public string? GoogleCloudLanguageCode { get; set; } = "en-US"; // Default language code
+
+
     }
 }

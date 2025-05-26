@@ -7,7 +7,7 @@ namespace RedditVideoMaker.Core
         public string OutputResolution { get; set; } = "1080x1920";
         public string Theme { get; set; } = "dark";
 
-        public string? BackgroundVideoPath { get; set; }
+        public string? BackgroundVideoPath { get; set; } // For visual background
         public int CardWidth { get; set; } = 800;
         public int CardHeight { get; set; } = 600;
         public string CardBackgroundColor { get; set; } = "DarkSlateGray";
@@ -25,7 +25,13 @@ namespace RedditVideoMaker.Core
         public float MetadataMinFontSize { get; set; } = 12f;
         public float MetadataMaxFontSize { get; set; } = 32f;
 
-        // New property for Step 17: Cleanup
-        public bool CleanUpIntermediateFiles { get; set; } = true; // Default to true
+        public bool CleanUpIntermediateFiles { get; set; } = true;
+
+        public string? IntroVideoPath { get; set; }
+        public string? OutroVideoPath { get; set; }
+
+        // New properties for Step 23: Background Music
+        public string? BackgroundMusicFilePath { get; set; }
+        public double BackgroundMusicVolume { get; set; } = 0.15; // Default to 15% volume
     }
 }

@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "atheists-392802",
+  "private_key_id": "4a47a942244424c6f3992fd12acddc35b6ae48a2",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDj8KqmxiyJXJUl\ndo/LXZfG1LVR7XWfDEpcXIqSr76gVHGLV1/LGFQOoES8FbnydUqQZ3eGApFXk539\nf9LZ5hFHciNpMLbz7Vj+13/tjKIsN9njYZJ/vz2MYAwdxJze6dLr07qKzMprR5/w\nG+gKlvPzW08z+s6MS8f3Kuh0QL4CicPuo88OOyOMkjzzDV1XHwWDvsmVr9CoDM30\nGjLmFy8kxPs/T8xKqwipNyQHDJuc+Egl9TcAQE3Esw8UZqQSweMssXAXXVBvCoiq\nJ+LCWw6jeO9q5JQFvzzJBjypJ7WUTdgxyW1/NU6Pnn+HXfT6OQCIdhMGCMoqE+Lb\n4ip2JKkTAgMBAAECggEAO3ZWhlAvYRwSWmYOB/7f78IglQFNzFJv+Z04lyCaqYet\n4SxHdJthnjkoBSrjycDYVUhwkTiNQtvi/LUCQ861Vj6Lx06qg4K40y5TlJw52DAv\nupYDGilA/KQ3tPJL/AjieZvPz5KyAX97VS9qfoy3khYRWN2GUWoZfbynTGBxUQay\nTeNqDOf5Ow1RcuO6dUHxWdVTFqPNopLm1PncXXdpcU3CWMCmozbpv/76nz+aP5W7\ntYukCAXNGb49Rln8kDrlMfKYDs9beG26chrdrnXBOqhFV9zT3s5n9xCtwDjRp6FK\nRWQB7mCDd0sGM/6KLn0alrKM5U8LPjZ/xLpyOpMZ4QKBgQD4TAp4llWbMOBJiEz4\n0lEt2whnEIwICUkJY8Y8SEayUJqN/6yMxzoCNWVMDk7ZjibdBFvwru2fT6zn34q0\nr3tdN11Upj6ZSot2jXZZhRv0cBwqk0/n61JyJhj26YqqlCRVFdgRe2fFa5c/LtYg\n/GP569Na9nEgdt1B5T3HUlGGcwKBgQDrAvPH1JOlb903u2IHprx6iF3JMErPD430\nDDBGjotglbyhAWQ7frds2ESnVzruiOo18pF1CoG8IKgK2iijygiyjX7m/XDjNrdv\nIcmUa3i9wtOb0b7yh9WmMMll3mvJ1dbnLTBAjfmEJHKfCFO/GkVIjz83biztvqhC\nBqdHIY8K4QKBgArgkejcdR2aU4kFHpIb7JB8su6I7AmCFqABrfKAHBC9tTeZRr7Y\nD3N/UVO2oL+pGYy/HyP5FdHP1LxHr7Tgpx/bSAxoR//BI0DrS476ZNIdgy5eS7bW\nOUNk5d0TOA7m9HyBu3hwlogwgWy0KY9CX0LYkObAOw54BpNXbpBny8h/AoGBALTC\niI9jSk0tRZHgZv5LmR0GVlyw8FljNWRJG7ipWzrm8TdFwrqgNKVbkzLDPWjLlpn4\nATls42y4EYiHVErm0tnDS6CPv4yEQYMREeM+5pfOisSHB7+0CvjQ/ZeFBJMyDyGw\n+DQu/4RMJH1+AiwzIKc2xwDzlUsoInLmezOS9FsBAoGAI6k8CtBiNlJ0ja2tlFbb\nQqwxb99wdz+WGNz9Yr5cwILLCWWjt0ppGDHbnkfBh6U/mb11l9z8ep046AeI5fba\nC2dpLQuW52f03NM7ZZBA59NE/SSzF0ou84RwmA5xfTz0vMUvj7+BJlFNIkLQvkzE\nLPgElVoh3noU+tYkXuJE+Uo=\n-----END PRIVATE KEY-----\n",
+  "client_email": "reddit-video-maker-tts@atheists-392802.iam.gserviceaccount.com",
+  "client_id": "117539345652987216665",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/reddit-video-maker-tts%40atheists-392802.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}
