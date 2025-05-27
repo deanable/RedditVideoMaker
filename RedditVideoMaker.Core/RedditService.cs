@@ -1,161 +1,255 @@
 ﻿// RedditService.cs (in RedditVideoMaker.Core project)
 using System;
 using System.Collections.Generic;
-using System.Linq;
+using System.Globalization; // For DateTime parsing
+using System.Linq; // For LINQ methods like OrderByDescending, FirstOrDefault, Take
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
-using System.Text.Json; // Required for JsonSerializer
+using System.Text.Json; // Required for JsonElement and JsonSerializerOptions
+using System.Text.RegularExpressions; // For Regex to parse PostUrl
 using System.Threading.Tasks;
-// using RedditVideoMaker.Core.Models; // Assuming models are in the same namespace
+using Microsoft.Extensions.Options; // Required for IOptions
 
 namespace RedditVideoMaker.Core
 {
     public class RedditService
     {
-        private static readonly HttpClient client = new HttpClient();
-        private static readonly JsonSerializerOptions jsonSerializerOptions = new JsonSerializerOptions
-        {
-            PropertyNameCaseInsensitive = true // Helpful if Reddit API casing varies slightly
-        };
+        private static readonly HttpClient _client = new HttpClient();
+        private readonly RedditOptions _redditOptions;
+        private readonly JsonSerializerOptions _jsonOptions;
 
-
-        public RedditService()
+        public RedditService(IOptions<RedditOptions> redditOptions)
         {
-            if (client.DefaultRequestHeaders.UserAgent.Count == 0)
+            _redditOptions = redditOptions.Value;
+            _jsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+
+            if (_client.DefaultRequestHeaders.UserAgent.Count == 0)
             {
-                client.DefaultRequestHeaders.UserAgent.ParseAdd("CsharpRedditBot/0.1 by YourRedditUsername");
-                client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                _client.DefaultRequestHeaders.UserAgent.ParseAdd($"CsharpRedditBot/0.6 by YourRedditUsername (config: {_redditOptions.Subreddit})"); // Version bump
+                _client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             }
         }
 
-        public async Task<List<RedditPostData>?> GetTopPostsAsync(string subreddit, int limit = 5)
+        private async Task<RedditPostData?> FetchSinglePostDataAsync(string subreddit, string postId)
         {
-            if (string.IsNullOrWhiteSpace(subreddit))
-            {
-                Console.Error.WriteLine("Error: Subreddit cannot be empty.");
-                return null;
-            }
-            string url = $"https://www.reddit.com/r/{subreddit}/top/.json?limit={limit}";
-            Console.WriteLine($"Fetching top posts from URL: {url}");
-
+            string url = $"https://www.reddit.com/r/{subreddit}/comments/{postId}.json";
+            Console.WriteLine($"RedditService: Fetching single post from URL: {url}");
             try
             {
-                RedditListingResponse? listingResponse = await client.GetFromJsonAsync<RedditListingResponse>(url, jsonSerializerOptions);
-
-                if (listingResponse?.Data?.Children != null)
+                var responseListings = await _client.GetFromJsonAsync<List<RedditListingResponse>>(url, _jsonOptions);
+                if (responseListings != null && responseListings.Any())
                 {
-                    var posts = new List<RedditPostData>();
-                    foreach (var child in listingResponse.Data.Children)
+                    var postListing = responseListings[0];
+                    if (postListing?.Data?.Children != null && postListing.Data.Children.Any())
                     {
-                        // The 'Data' property in RedditChild is 'object?'. We need to deserialize it properly.
-                        if (child.Data is JsonElement element && child.Kind == "t3") // "t3" is a link/post
+                        var postChild = postListing.Data.Children[0];
+                        if (postChild.Data is JsonElement element && postChild.Kind == "t3")
                         {
-                            RedditPostData? postData = element.Deserialize<RedditPostData>(jsonSerializerOptions);
-                            if (postData != null)
-                            {
-                                posts.Add(postData);
-                            }
+                            return element.Deserialize<RedditPostData>(_jsonOptions);
                         }
                     }
-                    return posts;
                 }
-                else
-                {
-                    Console.WriteLine("No posts found or error in response structure for top posts.");
-                    return new List<RedditPostData>();
-                }
+                Console.Error.WriteLine($"RedditService: Could not parse post data for {subreddit}/comments/{postId}");
+                return null;
             }
-            catch (HttpRequestException e)
+            catch (HttpRequestException httpEx)
             {
-                Console.Error.WriteLine($"Request error fetching top posts: {e.Message}");
-                // ... (existing error handling)
+                Console.Error.WriteLine($"RedditService: HTTP Error fetching single post {subreddit}/comments/{postId}: {httpEx.StatusCode} - {httpEx.Message}");
+                return null;
             }
-            catch (JsonException e)
+            catch (JsonException jsonEx)
             {
-                Console.Error.WriteLine($"JSON parsing error fetching top posts: {e.Message}");
+                Console.Error.WriteLine($"RedditService: JSON Error parsing single post {subreddit}/comments/{postId}: {jsonEx.Message}");
+                return null;
             }
-            catch (Exception e)
+            catch (Exception ex)
             {
-                Console.Error.WriteLine($"An unexpected error occurred fetching top posts: {e.Message}");
+                Console.Error.WriteLine($"RedditService: General Error fetching single post {subreddit}/comments/{postId}: {ex.Message}");
+                return null;
             }
-            return null;
         }
 
-        /// <summary>
-        /// Fetches comments for a specific Reddit post.
-        /// </summary>
-        /// <param name="subreddit">The subreddit of the post.</param>
-        /// <param name="postId">The ID of the post (without the "t3_" prefix).</param>
-        /// <param name="commentLimit">Max number of top-level comments to fetch (Reddit default/max varies).</param>
-        /// <param name="depth">Max depth of replies (not fully implemented here, Reddit default is usually deep).</param>
-        /// <returns>A list of RedditCommentData objects, or null if an error occurs.</returns>
-        public async Task<List<RedditCommentData>?> GetCommentsAsync(string subreddit, string postId, int commentLimit = 25)
+        private (string? Subreddit, string? PostId) ParseRedditPostUrl(string postUrl)
+        {
+            var regex = new Regex(@"reddit\.com/r/(?<subreddit>[^/]+)/comments/(?<postid>[^/]+)/?", RegexOptions.IgnoreCase);
+            var match = regex.Match(postUrl);
+
+            if (match.Success)
+            {
+                return (match.Groups["subreddit"].Value, match.Groups["postid"].Value);
+            }
+            Console.Error.WriteLine($"RedditService: Could not parse subreddit and post ID from URL: {postUrl}");
+            return (null, null);
+        }
+
+        public async Task<List<RedditPostData>> GetTopPostsAsync()
+        {
+            var selectedPostsResult = new List<RedditPostData>();
+
+            if (!string.IsNullOrWhiteSpace(_redditOptions.PostUrl))
+            {
+                Console.WriteLine($"RedditService: Attempting to fetch specific post from URL: {_redditOptions.PostUrl}");
+                var (subreddit, postId) = ParseRedditPostUrl(_redditOptions.PostUrl);
+                if (!string.IsNullOrWhiteSpace(subreddit) && !string.IsNullOrWhiteSpace(postId))
+                {
+                    RedditPostData? specificPost = await FetchSinglePostDataAsync(subreddit, postId);
+                    if (specificPost != null)
+                    {
+                        bool meetsCriteria = true;
+                        if (!_redditOptions.BypassPostFilters)
+                        {
+                            if (_redditOptions.MinPostCommentsCount > 0 && specificPost.NumberOfComments < _redditOptions.MinPostCommentsCount)
+                            {
+                                Console.WriteLine($"RedditService: Post from URL {specificPost.Id} has {specificPost.NumberOfComments} comments, less than MinPostCommentsCount of {_redditOptions.MinPostCommentsCount}.");
+                                meetsCriteria = false;
+                            }
+                            if (meetsCriteria && _redditOptions.MinPostUpvotes > 0 && specificPost.Score < _redditOptions.MinPostUpvotes)
+                            {
+                                Console.WriteLine($"RedditService: Post from URL {specificPost.Id} has {specificPost.Score} upvotes, less than MinPostUpvotes of {_redditOptions.MinPostUpvotes}.");
+                                meetsCriteria = false;
+                            }
+                        }
+
+                        if (meetsCriteria)
+                        {
+                            selectedPostsResult.Add(specificPost); // Add the single specified post if it meets criteria (or if filters bypassed)
+                        }
+                        else
+                        {
+                            Console.WriteLine($"RedditService: Specified post from URL does not meet all configured criteria and filters are not bypassed. Not processing.");
+                        }
+                    }
+                    else { Console.Error.WriteLine($"RedditService: Failed to fetch or parse post from URL: {_redditOptions.PostUrl}"); }
+                }
+                else { Console.Error.WriteLine($"RedditService: Invalid PostUrl format: {_redditOptions.PostUrl}"); }
+            }
+            else
+            {
+                Console.WriteLine($"RedditService: Scanning /r/{_redditOptions.Subreddit} for posts. Sort: '{_redditOptions.PostId}', Scan Limit: {_redditOptions.SubredditPostsToScan}");
+                string url = $"https://www.reddit.com/r/{_redditOptions.Subreddit}/{_redditOptions.PostId}/.json?limit={_redditOptions.SubredditPostsToScan}";
+                try
+                {
+                    RedditListingResponse? listingResponse = await _client.GetFromJsonAsync<RedditListingResponse>(url, _jsonOptions);
+                    if (listingResponse?.Data?.Children != null)
+                    {
+                        var candidates = new List<RedditPostData>();
+                        foreach (var child in listingResponse.Data.Children)
+                        {
+                            if (child.Data is JsonElement element && child.Kind == "t3")
+                            {
+                                RedditPostData? postData = element.Deserialize<RedditPostData>(_jsonOptions);
+                                if (postData != null)
+                                {
+                                    if (_redditOptions.BypassPostFilters)
+                                    {
+                                        candidates.Add(postData);
+                                        continue;
+                                    }
+
+                                    bool dateFilterPassed = true;
+                                    if (!string.IsNullOrWhiteSpace(_redditOptions.PostFilterStartDate) &&
+                                        DateTime.TryParseExact(_redditOptions.PostFilterStartDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime startDate))
+                                    {
+                                        if (DateTimeOffset.FromUnixTimeSeconds((long)postData.CreatedUtc).UtcDateTime < startDate)
+                                        { dateFilterPassed = false; }
+                                    }
+                                    if (dateFilterPassed && !string.IsNullOrWhiteSpace(_redditOptions.PostFilterEndDate) &&
+                                        DateTime.TryParseExact(_redditOptions.PostFilterEndDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime endDate))
+                                    {
+                                        if (DateTimeOffset.FromUnixTimeSeconds((long)postData.CreatedUtc).UtcDateTime >= endDate.AddDays(1))
+                                        { dateFilterPassed = false; }
+                                    }
+
+                                    bool commentsCountPassed = _redditOptions.MinPostCommentsCount <= 0 || postData.NumberOfComments >= _redditOptions.MinPostCommentsCount;
+                                    bool upvotesPassed = _redditOptions.MinPostUpvotes <= 0 || postData.Score >= _redditOptions.MinPostUpvotes;
+                                    bool isSelfPostOrDirectImage = !postData.IsVideo && (postData.Url.Contains($"/r/{postData.Subreddit}/comments/") || Regex.IsMatch(postData.Url, @"\.(jpeg|jpg|gif|png)$", RegexOptions.IgnoreCase));
+
+                                    if (dateFilterPassed && commentsCountPassed && upvotesPassed && isSelfPostOrDirectImage)
+                                    {
+                                        candidates.Add(postData);
+                                    }
+                                }
+                            }
+                        }
+                        Console.WriteLine($"RedditService: Found {candidates.Count} candidate posts after all filters (BypassPostFilters: {_redditOptions.BypassPostFilters}).");
+                        if (candidates.Any())
+                        {
+                            // Select up to NumberOfVideosInBatch, ordered by score (or other criteria if desired)
+                            selectedPostsResult.AddRange(candidates
+                                .OrderByDescending(p => p.Score) // Example: order by score
+                                .Take(_redditOptions.NumberOfVideosInBatch)
+                                .ToList());
+                            Console.WriteLine($"RedditService: Selected {selectedPostsResult.Count} posts for batch processing.");
+                        }
+                    }
+                }
+                catch (Exception ex) { Console.Error.WriteLine($"RedditService: Error fetching posts from /r/{_redditOptions.Subreddit}: {ex.Message}"); }
+            }
+
+            if (!selectedPostsResult.Any())
+            {
+                Console.Error.WriteLine("RedditService: No suitable post(s) found based on current criteria and filters.");
+            }
+            return selectedPostsResult;
+        }
+
+        public async Task<List<RedditCommentData>?> GetCommentsAsync(string subreddit, string postId, int commentFetchLimit = 100)
         {
             if (string.IsNullOrWhiteSpace(subreddit) || string.IsNullOrWhiteSpace(postId))
             {
-                Console.Error.WriteLine("Error: Subreddit and Post ID cannot be empty for fetching comments.");
+                Console.Error.WriteLine("RedditService Error: Subreddit and Post ID cannot be empty for fetching comments.");
                 return null;
             }
-
-            // Construct the URL for the post's comments JSON endpoint
-            // Example: https://www.reddit.com/r/learnprogramming/comments/123xyz/slug.json?limit=25
-            // The slug is optional.
-            string url = $"https://www.reddit.com/r/{subreddit}/comments/{postId}.json?limit={commentLimit}";
-            Console.WriteLine($"Fetching comments from URL: {url}");
+            string url = $"https://www.reddit.com/r/{subreddit}/comments/{postId}.json?limit={commentFetchLimit}&depth=1&sort={_redditOptions.CommentSortOrder}";
+            Console.WriteLine($"RedditService: Fetching comments from URL: {url}");
 
             try
             {
-                // The response for comments is an array of two listings:
-                // [0]: The post itself
-                // [1]: The comments
-                List<RedditListingResponse>? responseListings = await client.GetFromJsonAsync<List<RedditListingResponse>>(url, jsonSerializerOptions);
-
+                List<RedditListingResponse>? responseListings = await _client.GetFromJsonAsync<List<RedditListingResponse>>(url, _jsonOptions);
                 if (responseListings != null && responseListings.Count > 1)
                 {
-                    RedditListingResponse? commentListing = responseListings[1]; // Second element contains comments
+                    RedditListingResponse? commentListing = responseListings[1];
                     if (commentListing?.Data?.Children != null)
                     {
                         var comments = new List<RedditCommentData>();
                         foreach (var child in commentListing.Data.Children)
                         {
-                            if (child.Data is JsonElement element)
+                            if (child.Data is JsonElement element && child.Kind == "t1")
                             {
-                                if (child.Kind == "t1") // "t1" is a comment
+                                RedditCommentData? commentData = element.Deserialize<RedditCommentData>(_jsonOptions);
+                                bool includeThisComment = commentData != null &&
+                                                          !string.IsNullOrWhiteSpace(commentData.Body) &&
+                                                          commentData.Author != "[deleted]" &&
+                                                          !commentData.IsStickied;
+
+                                if (includeThisComment && !_redditOptions.BypassCommentScoreFilter)
                                 {
-                                    RedditCommentData? commentData = element.Deserialize<RedditCommentData>(jsonSerializerOptions);
-                                    if (commentData != null && !string.IsNullOrWhiteSpace(commentData.Body) && commentData.Author != "[deleted]")
-                                    {
-                                        comments.Add(commentData);
-                                    }
+                                    includeThisComment = _redditOptions.MinCommentScore == int.MinValue || commentData!.Score >= _redditOptions.MinCommentScore;
                                 }
-                                else if (child.Kind == "more")
+
+                                if (includeThisComment && _redditOptions.CommentIncludeKeywords.Any())
                                 {
-                                    // Handle "more" objects if needed (e.g., to load more replies)
-                                    // For now, we'll just log it.
-                                    // Console.WriteLine($"Encountered 'more' comments object (ID: {element.TryGetProperty("id", out var idEl) ? idEl.GetString() : "N/A"}).");
+                                    includeThisComment = _redditOptions.CommentIncludeKeywords
+                                        .Any(keyword => commentData!.Body!.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+                                }
+
+                                if (includeThisComment)
+                                {
+                                    comments.Add(commentData!);
                                 }
                             }
                         }
+                        Console.WriteLine($"RedditService: Fetched {comments.Count} comments after all filters for post {postId}.");
                         return comments;
                     }
                 }
-                Console.WriteLine("No comments found or error in comment response structure.");
+                Console.WriteLine($"RedditService: No comments found or error in comment response structure for post {postId}.");
                 return new List<RedditCommentData>();
             }
-            catch (HttpRequestException e)
+            catch (Exception ex)
             {
-                Console.Error.WriteLine($"Request error fetching comments: {e.Message}");
-                if (e.StatusCode.HasValue) Console.Error.WriteLine($"Status Code: {e.StatusCode.Value}");
-            }
-            catch (JsonException e)
-            {
-                Console.Error.WriteLine($"JSON parsing error fetching comments: {e.Message}");
-                Console.Error.WriteLine($"Problematic URL: {url}");
-            }
-            catch (Exception e)
-            {
-                Console.Error.WriteLine($"An unexpected error occurred fetching comments: {e.Message}");
+                Console.Error.WriteLine($"RedditService Error: Error fetching comments for {subreddit}/{postId}: {ex.Message}");
             }
             return null;
         }

@@ -1,18 +1,36 @@
 ﻿// RedditOptions.cs (in RedditVideoMaker.Core project)
+using System.Collections.Generic;
+
 namespace RedditVideoMaker.Core
 {
-    // This class will hold settings related to Reddit.
     public class RedditOptions
     {
-        public const string SectionName = "RedditOptions"; // Convention to define section name
+        public const string SectionName = "RedditOptions";
 
-        // The name of the subreddit to fetch posts from.
-        public string Subreddit { get; set; } = "AskReddit"; // Default value
+        public string Subreddit { get; set; } = "AskReddit";
+        public string PostId { get; set; } = "top";
+        public bool AllowNsfw { get; set; } = false;
 
-        // The ID of the post to fetch, or "latest" for the newest.
-        public string PostId { get; set; } = "latest"; // Default value
+        public string? PostUrl { get; set; }
+        public int MinPostUpvotes { get; set; } = 0;
+        public int MinPostCommentsCount { get; set; } = 0;
+        public string? PostFilterStartDate { get; set; }
+        public string? PostFilterEndDate { get; set; }
 
-        // Whether to allow NSFW (Not Safe For Work) content.
-        public bool AllowNsfw { get; set; } = false; // Default value
+        public int MinCommentScore { get; set; } = int.MinValue;
+
+        public int SubredditPostsToScan { get; set; } = 50;
+
+        public bool BypassPostFilters { get; set; } = false;
+        public bool BypassCommentScoreFilter { get; set; } = false;
+
+        public string CommentSortOrder { get; set; } = "top";
+        public List<string> CommentIncludeKeywords { get; set; } = new List<string>();
+
+        // New property for Step 26: Batch Processing
+        /// <summary>
+        /// Number of videos to generate in a batch run if PostUrl is not specified.
+        /// </summary>
+        public int NumberOfVideosInBatch { get; set; } = 1; // Default to 1 (current behavior)
     }
 }

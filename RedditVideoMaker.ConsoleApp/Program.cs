@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
-using RedditVideoMaker.Core;
+using RedditVideoMaker.Core; // This should bring in FileLogger and other Core classes
 using FFMpegCore;
 using SixLabors.Fonts;
 
@@ -14,18 +14,45 @@ public class Program
 {
     public static async Task Main(string[] args)
     {
+        // Initialize FileLogger as early as possible.
+        // Load configuration manually for these specific logger settings first.
+        var initialConfigForLogging = new ConfigurationBuilder()
+            .SetBasePath(Directory.GetCurrentDirectory())
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+            .Build();
+
+        // Get logger-specific settings directly from this initial configuration.
+        string logDirFromJson = initialConfigForLogging.GetValue<string>("GeneralOptions:LogFileDirectory") ?? "logs";
+        int retentionDaysFromJson = initialConfigForLogging.GetValue<int?>("GeneralOptions:LogFileRetentionDays") ?? 7;
+        string consoleLevelStringFromJson = initialConfigForLogging.GetValue<string>("GeneralOptions:ConsoleOutputLevel") ?? "Detailed";
+
+        if (!Enum.TryParse<ConsoleLogLevel>(consoleLevelStringFromJson, true, out ConsoleLogLevel consoleLogLevel))
+        {
+            consoleLogLevel = ConsoleLogLevel.Detailed; // Default if parsing fails
+            // Use Console.Error directly here as logger isn't initialized yet if this fails.
+            Console.Error.WriteLine($"Warning: Invalid ConsoleOutputLevel '{consoleLevelStringFromJson}' in appsettings.json. Defaulting to '{consoleLogLevel}'.");
+        }
+
+        // Ensure the log directory path is combined with the application's base directory
+        // if "logs" is meant to be a relative path from where the app runs.
+        string fullLogDirectoryPath = Path.Combine(AppContext.BaseDirectory, logDirFromJson);
+
+        FileLogger.Initialize(fullLogDirectoryPath, consoleLogLevel); // This line expects FileLogger.Initialize to take ConsoleLogLevel
+        FileLogger.CleanupOldLogFiles(retentionDaysFromJson);
+
+        Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC] Application Startup. Logging Initialized. Console Level: {consoleLogLevel}");
+        // --- End of Initial FileLogger Setup ---
+
         string baseDirectory = AppContext.BaseDirectory;
         string ffmpegBinFolder = Path.Combine(baseDirectory, "ffmpeg_bin");
         if (Directory.Exists(ffmpegBinFolder) && File.Exists(Path.Combine(ffmpegBinFolder, "ffmpeg.exe")) && File.Exists(Path.Combine(ffmpegBinFolder, "ffprobe.exe")))
         { GlobalFFOptions.Configure(new FFOptions { BinaryFolder = ffmpegBinFolder }); Console.WriteLine($"FFMpegCore: Configured from: {ffmpegBinFolder}"); }
         else { Console.Error.WriteLine($"FFMpegCore Error: ffmpeg_bin or executables not found at {ffmpegBinFolder}. Using PATH if available."); }
 
-        Console.WriteLine("\nReddit Video Maker Bot C# - Step 23: Adding Background Music");
+        Console.WriteLine("\nReddit Video Maker Bot C# - Step 27.1: Daily File Logging with Retention");
 
-        IConfiguration configuration = new ConfigurationBuilder()
-            .SetBasePath(Directory.GetCurrentDirectory())
-            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-            .Build();
+        // Use the already built configuration for the rest of the DI setup
+        IConfiguration configuration = initialConfigForLogging;
 
         var services = new ServiceCollection();
         // Configure options
@@ -50,22 +77,22 @@ public class Program
         var ttsOptions = serviceProvider.GetService<IOptions<TtsOptions>>()?.Value;
         var youtubeOptions = serviceProvider.GetService<IOptions<YouTubeOptions>>()?.Value;
 
-        if (generalOptions == null || redditOptions == null || videoOptions == null || ttsOptions == null || youtubeOptions == null || string.IsNullOrWhiteSpace(redditOptions.Subreddit))
-        { Console.Error.WriteLine("Error: One or more options sections not configured properly in appsettings.json."); Console.ReadKey(); return; }
+        if (generalOptions == null || redditOptions == null || videoOptions == null || ttsOptions == null || youtubeOptions == null)
+        { Console.Error.WriteLine("Error: One or more options sections not configured properly in appsettings.json."); FileLogger.Dispose(); Console.ReadKey(); return; }
+
+        if (string.IsNullOrWhiteSpace(redditOptions.PostUrl) && string.IsNullOrWhiteSpace(redditOptions.Subreddit))
+        { Console.Error.WriteLine("Error: Either PostUrl or Subreddit must be configured in RedditOptions in appsettings.json."); FileLogger.Dispose(); Console.ReadKey(); return; }
+
 
         Console.WriteLine($"Testing Mode Enabled: {generalOptions.IsInTestingModule}");
+        // Log the actual console output level being used by FileLogger
+        Console.WriteLine($"Actual Console Output Level in use by FileLogger: {consoleLogLevel}");
 
-        // Background video path is still essential for clip creation
         if (string.IsNullOrWhiteSpace(videoOptions.BackgroundVideoPath) || !File.Exists(videoOptions.BackgroundVideoPath))
-        { Console.Error.WriteLine($"Error: BackgroundVideoPath is not configured or file not found: '{videoOptions.BackgroundVideoPath}'. Please check appsettings.json."); Console.ReadKey(); return; }
-
-        // Background music path is optional, so only warn if specified but not found
-        if (!string.IsNullOrWhiteSpace(videoOptions.BackgroundMusicFilePath) && !File.Exists(videoOptions.BackgroundMusicFilePath))
-        { Console.Error.WriteLine($"Warning: BackgroundMusicFilePath is specified ('{videoOptions.BackgroundMusicFilePath}') but file not found. Background music will be skipped."); }
-
+        { Console.Error.WriteLine($"Error: BackgroundVideoPath is not configured or file not found: '{videoOptions.BackgroundVideoPath}'. Please check appsettings.json."); FileLogger.Dispose(); Console.ReadKey(); return; }
 
         if (!generalOptions.IsInTestingModule && (string.IsNullOrWhiteSpace(youtubeOptions.ClientSecretJsonPath) || !File.Exists(youtubeOptions.ClientSecretJsonPath)))
-        { Console.Error.WriteLine($"Error: YouTube ClientSecretJsonPath is not configured or file not found: '{youtubeOptions.ClientSecretJsonPath}'. This is required when not in testing mode. Please check appsettings.json."); Console.ReadKey(); return; }
+        { Console.Error.WriteLine($"Error: YouTube ClientSecretJsonPath is not configured or file not found. This is required when not in testing mode."); FileLogger.Dispose(); Console.ReadKey(); return; }
 
 
         var redditService = serviceProvider.GetRequiredService<RedditService>();
@@ -74,25 +101,40 @@ public class Program
         var videoService = serviceProvider.GetRequiredService<VideoService>();
         var youTubeService = serviceProvider.GetRequiredService<YouTubeService>();
 
-        Console.WriteLine($"\nFetching top posts from /r/{redditOptions.Subreddit}");
-        List<RedditPostData>? topPosts = await redditService.GetTopPostsAsync(redditOptions.Subreddit, limit: 1);
+        Console.WriteLine($"\nAttempting to select Reddit post(s) based on configuration...");
+        List<RedditPostData> postsToProcess = await redditService.GetTopPostsAsync();
 
-        if (topPosts != null && topPosts.Any())
+        if (postsToProcess == null || !postsToProcess.Any())
         {
-            RedditPostData selectedPost = topPosts.First();
-            Console.WriteLine($"\nSelected post: {selectedPost.Title} by {selectedPost.Author} (Score: {selectedPost.Score})");
-
-            if (string.IsNullOrWhiteSpace(selectedPost.Id) || string.IsNullOrWhiteSpace(selectedPost.Subreddit) || string.IsNullOrWhiteSpace(selectedPost.Title))
-            { Console.Error.WriteLine("Fetched post missing critical info (ID, Subreddit, or Title)."); }
-            else
+            Console.WriteLine("No suitable posts found to process.");
+        }
+        else
+        {
+            int postCounter = 0;
+            foreach (var selectedPost in postsToProcess)
             {
+                postCounter++;
+                Console.WriteLine($"\n--- Processing Post {postCounter} of {postsToProcess.Count}: \"{selectedPost.Title}\" by {selectedPost.Author} ---");
+                Console.WriteLine($"Post URL: https://www.reddit.com{selectedPost.Permalink}");
+
+                if (string.IsNullOrWhiteSpace(selectedPost.Id) || string.IsNullOrWhiteSpace(selectedPost.Subreddit) || string.IsNullOrWhiteSpace(selectedPost.Title))
+                {
+                    Console.Error.WriteLine($"Skipping post {selectedPost.Id ?? "Unknown"} due to missing critical info (ID, Subreddit, or Title).");
+                    continue;
+                }
+
                 List<string> individualVideoClips = new List<string>();
                 List<string> intermediateFilesToClean = new List<string>();
 
                 string baseOutputDir = Path.Combine(Directory.GetCurrentDirectory(), "output_files");
-                string ttsDir = Path.Combine(baseOutputDir, "tts"); string imgDir = Path.Combine(baseOutputDir, "images");
-                string clipsDir = Path.Combine(baseOutputDir, "clips"); string finalDir = Path.Combine(baseOutputDir, "final_video");
-                Directory.CreateDirectory(ttsDir); Directory.CreateDirectory(imgDir); Directory.CreateDirectory(clipsDir); Directory.CreateDirectory(finalDir);
+                string ttsDir = Path.Combine(baseOutputDir, "tts");
+                string imgDir = Path.Combine(baseOutputDir, "images");
+                string clipsDir = Path.Combine(baseOutputDir, "clips");
+                string finalDir = Path.Combine(baseOutputDir, "final_video");
+                Directory.CreateDirectory(ttsDir);
+                Directory.CreateDirectory(imgDir);
+                Directory.CreateDirectory(clipsDir);
+                Directory.CreateDirectory(finalDir);
 
                 int finalVideoWidth = 1080; int finalVideoHeight = 1920;
                 if (!string.IsNullOrWhiteSpace(videoOptions.OutputResolution) && videoOptions.OutputResolution.Contains('x', StringComparison.OrdinalIgnoreCase))
@@ -109,7 +151,6 @@ public class Program
                 Console.WriteLine($"Font Sizes (Metadata Target/Min/Max): {videoOptions.MetadataTargetFontSize}/{videoOptions.MetadataMinFontSize}/{videoOptions.MetadataMaxFontSize}");
                 Console.WriteLine($"Cleanup Intermediate Files: {videoOptions.CleanUpIntermediateFiles}");
                 Console.WriteLine($"TTS Engine Configured (before Testing Mode override): {ttsOptions.Engine}");
-                Console.WriteLine($"Background Music File: {(string.IsNullOrWhiteSpace(videoOptions.BackgroundMusicFilePath) ? "Not configured" : videoOptions.BackgroundMusicFilePath)} (Volume: {videoOptions.BackgroundMusicVolume})");
 
 
                 FontFamily? nullableMeasuringFontFamily = null;
@@ -131,7 +172,7 @@ public class Program
                 }
 
                 // --- Process Post Title as a Clip ---
-                Console.WriteLine($"\n--- Processing Post Title ---");
+                Console.WriteLine($"\n--- Processing Post Title for post {selectedPost.Id} ---");
                 string cleanedTitleForTts = TextUtilities.CleanTextForTts(selectedPost.Title!);
                 string titleForCard = selectedPost.Title!;
                 string titleId = $"post_{selectedPost.Id!.Replace(" ", "_")}";
@@ -150,7 +191,7 @@ public class Program
                     Console.WriteLine($"Title clip created: {titleClipPath}");
                     individualVideoClips.Add(titleClipPath);
                 }
-                else { Console.Error.WriteLine("Failed to process title clip."); }
+                else { Console.Error.WriteLine($"Failed to process title clip for post {selectedPost.Id}."); }
 
                 // --- Process Post Self-Text as a Clip (with splitting) ---
                 if (!string.IsNullOrWhiteSpace(selectedPost.Selftext) && nullableMeasuringFontFamily != null)
@@ -185,16 +226,28 @@ public class Program
                         }
                         else { Console.Error.WriteLine($"Failed to process self-text clip (page {selfTextPageIndex})."); }
                     }
-                } // ... (rest of self-text handling)
+                }
+                else if (string.IsNullOrWhiteSpace(selectedPost.Selftext))
+                {
+                    Console.WriteLine("No self-text for this post.");
+                }
+                else if (nullableMeasuringFontFamily == null)
+                {
+                    Console.Error.WriteLine("Skipping self-text processing as no usable measuring font was available.");
+                }
 
 
                 // --- Process Comments as Clips ---
-                Console.WriteLine($"\nFetching comments for post ID: {selectedPost.Id}...");
-                int commentsToFetch = videoOptions.NumberOfCommentsToInclude > 0 ? (videoOptions.NumberOfCommentsToInclude * 2) + 5 : 10;
-                List<RedditCommentData>? comments = await redditService.GetCommentsAsync(selectedPost.Subreddit!, selectedPost.Id!, commentLimit: commentsToFetch);
-                if (comments != null && comments.Any())
+                Console.WriteLine($"\nFetching comments for post ID: {selectedPost.Id} from subreddit /r/{selectedPost.Subreddit}...");
+                int initialCommentFetchLimit = (videoOptions.NumberOfCommentsToInclude * 3) + 20;
+                List<RedditCommentData>? fetchedComments = await redditService.GetCommentsAsync(selectedPost.Subreddit!, selectedPost.Id!, commentFetchLimit: initialCommentFetchLimit);
+
+                if (fetchedComments != null && fetchedComments.Any())
                 {
-                    var suitableComments = comments.Where(c => !string.IsNullOrWhiteSpace(c.Body) && c.Body.Length > 10).Take(videoOptions.NumberOfCommentsToInclude).ToList();
+                    var suitableComments = fetchedComments
+                        .Where(c => !string.IsNullOrWhiteSpace(c.Body) && c.Body.Length > 10)
+                        .Take(videoOptions.NumberOfCommentsToInclude)
+                        .ToList();
                     Console.WriteLine($"\nProcessing {suitableComments.Count} suitable comments (target: {videoOptions.NumberOfCommentsToInclude})...");
                     int idx = 0;
                     foreach (var comment in suitableComments)
@@ -217,7 +270,7 @@ public class Program
                         else { Console.Error.WriteLine($"Failed to process comment clip {idx}."); }
                     }
                 }
-                else { Console.WriteLine("No comments found for the post."); }
+                else { Console.WriteLine("No comments found for the post (or none met score criteria)."); }
 
                 // --- Add Outro Clip if specified ---
                 if (!string.IsNullOrWhiteSpace(videoOptions.OutroVideoPath) && File.Exists(videoOptions.OutroVideoPath))
@@ -227,50 +280,57 @@ public class Program
                 }
 
 
-                // --- Concatenate all video clips ---
+                // --- Concatenate all video clips for the current post ---
                 if (individualVideoClips.Any())
                 {
                     string finalVideoPath = Path.Combine(finalDir, $"final_video_{selectedPost.Id}.mp4");
-                    Console.WriteLine($"\nConcatenating {individualVideoClips.Count} clips into {finalVideoPath}...");
+                    Console.WriteLine($"\nConcatenating {individualVideoClips.Count} clips for post {selectedPost.Id} into {finalVideoPath}...");
                     bool concatenationSuccess = await videoService.ConcatenateVideosAsync(individualVideoClips, finalVideoPath);
 
                     if (concatenationSuccess)
                     {
-                        Console.WriteLine($"Final video created: {finalVideoPath}");
+                        Console.WriteLine($"Final video created for post {selectedPost.Id}: {finalVideoPath}");
                         if (!generalOptions.IsInTestingModule)
                         {
-                            Console.WriteLine("\n--- Attempting YouTube Upload ---");
+                            Console.WriteLine($"\n--- Attempting YouTube Upload for post {selectedPost.Id} ---");
                             string videoTitle = !string.IsNullOrWhiteSpace(selectedPost.Title) ? TextUtilities.CleanTextForTts(selectedPost.Title) : youtubeOptions.DefaultVideoTitle;
                             string videoDescription = $"Reddit story from /r/{selectedPost.Subreddit}.\nOriginal post by u/{selectedPost.Author}.\n\n{youtubeOptions.DefaultVideoDescription}";
                             if (!string.IsNullOrWhiteSpace(selectedPost.Selftext))
                             { videoDescription += $"\n\nPost Text:\n{TextUtilities.CleanTextForTts(selectedPost.Selftext).Substring(0, Math.Min(TextUtilities.CleanTextForTts(selectedPost.Selftext).Length, 300))}..."; }
-                            var uploadedVideo = await youTubeService.UploadVideoAsync(finalVideoPath, videoTitle, videoDescription, youtubeOptions.DefaultVideoTags.ToArray(), youtubeOptions.DefaultVideoCategoryId, youtubeOptions.DefaultVideoPrivacyStatus);
-                            if (uploadedVideo != null) { Console.WriteLine($"Successfully uploaded video! YouTube ID: {uploadedVideo.Id}"); }
-                            else { Console.Error.WriteLine("YouTube upload failed. Check previous logs."); }
+
+                            var uploadedVideo = await youTubeService.UploadVideoAsync(
+                                finalVideoPath, videoTitle, videoDescription, youtubeOptions.DefaultVideoTags.ToArray(),
+                                youtubeOptions.DefaultVideoCategoryId, youtubeOptions.DefaultVideoPrivacyStatus
+                            );
+
+                            if (uploadedVideo != null)
+                            {
+                                Console.WriteLine($"Successfully uploaded video! YouTube ID: {uploadedVideo.Id}");
+                                Console.WriteLine($"Watch it at: https://www.youtube.com/watch?v={uploadedVideo.Id}");
+                            }
+                            else { Console.Error.WriteLine($"YouTube upload failed for post {selectedPost.Id}. Check previous logs."); }
                         }
-                        else { Console.WriteLine("\nTesting Mode: YouTube upload skipped."); }
+                        else { Console.WriteLine($"\nTesting Mode: YouTube upload skipped for post {selectedPost.Id}."); }
 
                         if (videoOptions.CleanUpIntermediateFiles)
                         {
-                            Console.WriteLine("Cleaning up intermediate files...");
-                            foreach (var clipPath in individualVideoClips)
-                            {
-                                if (clipPath.StartsWith(clipsDir) && File.Exists(clipPath))
-                                { File.Delete(clipPath); }
-                            }
+                            Console.WriteLine($"Cleaning up intermediate files for post {selectedPost.Id}...");
+                            var generatedClipsForThisPost = individualVideoClips.Where(p => p.StartsWith(clipsDir));
+                            intermediateFilesToClean.AddRange(generatedClipsForThisPost);
+
                             foreach (var filePath in intermediateFilesToClean)
                             { try { if (File.Exists(filePath)) File.Delete(filePath); } catch (Exception ex) { Console.Error.WriteLine($"Error deleting file {filePath}: {ex.Message}"); } }
-                            Console.WriteLine("Intermediate files cleanup process completed.");
+                            Console.WriteLine($"Intermediate files cleanup process completed for post {selectedPost.Id}.");
                         }
                     }
-                    else { Console.Error.WriteLine("Failed to concatenate video clips. YouTube upload will be skipped."); }
+                    else { Console.Error.WriteLine($"Failed to concatenate video clips for post {selectedPost.Id}."); }
                 }
-                else { Console.WriteLine("No video clips to concatenate for YouTube upload."); }
-            }
+                else { Console.WriteLine($"No video clips were generated for post {selectedPost.Id} to concatenate."); }
+            } // End of foreach post loop
         }
-        else { Console.WriteLine($"No top posts found in /r/{redditOptions.Subreddit}."); }
 
-        Console.WriteLine("\nEnd of Step 23. Press any key to exit.");
+        Console.WriteLine("\nEnd of processing. Press any key to exit.");
+        FileLogger.Dispose();
         Console.ReadKey();
     }
 }

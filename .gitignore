@@ -361,3 +361,6 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+/RedditVideoMaker.ConsoleApp/appsettings.json
+/RedditVideoMaker.ConsoleApp/client_secret.json
+/RedditVideoMaker.ConsoleApp/google.json

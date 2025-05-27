@@ -21,21 +21,8 @@ namespace RedditVideoMaker.Core
         public VideoService(IOptions<VideoOptions> videoOptions)
         {
             _videoOptions = videoOptions.Value;
-            // GlobalFFOptions (like BinaryFolder for ffmpeg executables) should be configured 
-            // in Program.cs or a similar application startup location.
         }
 
-        /// <summary>
-        /// Creates a video clip by overlaying an image (card) onto a background video, 
-        /// synchronized with TTS audio, and optionally mixing in background music.
-        /// </summary>
-        /// <param name="backgroundVideoPath">Path to the looping visual background video.</param>
-        /// <param name="overlayCardPath">Path to the image card (e.g., comment image).</param>
-        /// <param name="ttsAudioPath">Path to the TTS audio file for this clip.</param>
-        /// <param name="outputClipPath">Path to save the output video clip.</param>
-        /// <param name="finalVideoWidth">Width of the final output video clip.</param>
-        /// <param name="finalVideoHeight">Height of the final output video clip.</param>
-        /// <returns>True if successful, false otherwise.</returns>
         public async Task<bool> CreateClipWithBackgroundAsync(
             string backgroundVideoPath,
             string overlayCardPath,
@@ -55,8 +42,8 @@ namespace RedditVideoMaker.Core
                 string? directory = Path.GetDirectoryName(outputClipPath);
                 if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory)) Directory.CreateDirectory(directory);
 
-                IMediaAnalysis ttsAudioInfo = await FFProbe.AnalyseAsync(ttsAudioPath);
-                TimeSpan clipDuration = ttsAudioInfo.Duration;
+                IMediaAnalysis audioInfo = await FFProbe.AnalyseAsync(ttsAudioPath);
+                TimeSpan clipDuration = audioInfo.Duration;
                 if (clipDuration <= TimeSpan.Zero) { Console.Error.WriteLine($"VideoService Error: Invalid audio duration for {ttsAudioPath}."); return false; }
 
                 Console.WriteLine($"VideoService: Creating clip '{Path.GetFileName(outputClipPath)}'. Duration: {clipDuration}, Output Size: {finalVideoWidth}x{finalVideoHeight}");
@@ -70,18 +57,21 @@ namespace RedditVideoMaker.Core
                     .AddFileInput(overlayCardPath, false,
                         opt => {
                             opt.WithCustomArgument("-loop 1");          // Input 1: Overlay card image
-                            opt.WithCustomArgument("-framerate 25"); // Define a framerate for the looped image
+                            opt.WithCustomArgument("-framerate 25");
                         });
 
                 inputArguments.AddFileInput(ttsAudioPath); // Input 2: TTS Audio
 
-                string videoFilterGraph =
+                var filterComplexBuilder = new StringBuilder();
+                string finalVideoMapLabel = "[vout]";
+                string finalAudioMapLabel;
+
+                // Video part of the filter graph (always present)
+                filterComplexBuilder.Append(
                     $"[0:v]scale={finalVideoWidth}:{finalVideoHeight}:force_original_aspect_ratio=decrease,pad={finalVideoWidth}:{finalVideoHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[bg];" +
                     $"[1:v]scale='iw*min(1,min({finalVideoWidth}*0.9/iw,{finalVideoHeight}*0.8/ih))':-1,format=rgba[fg];" +
-                    $"[bg][fg]overlay=(W-w)/2:(H-h)/2[vout]"; // Video output stream labeled [vout]
-
-                string audioFilterGraphPart = "";
-                string finalAudioMapLabel = "[2:a]"; // Default to TTS audio (input 2)
+                    $"[bg][fg]overlay=(W-w)/2:(H-h)/2{finalVideoMapLabel}"
+                );
 
                 bool useBackgroundMusic = !string.IsNullOrWhiteSpace(_videoOptions.BackgroundMusicFilePath) &&
                                           File.Exists(_videoOptions.BackgroundMusicFilePath) &&
@@ -93,23 +83,20 @@ namespace RedditVideoMaker.Core
                     inputArguments = inputArguments.AddFileInput(_videoOptions.BackgroundMusicFilePath!, false,
                         opt => opt.WithCustomArgument("-stream_loop -1")); // Input 3: Background Music (looped)
 
-                    // TTS is [2:a], Background Music is [3:a]
-                    // Adjust volume of background music, then mix with TTS.
-                    // 'aloop' ensures bg music is long enough. 'amix' mixes. 'duration=first' makes mixed audio as long as TTS.
                     string musicVolume = _videoOptions.BackgroundMusicVolume.ToString(CultureInfo.InvariantCulture);
-                    // Ensure dropout_transition is not longer than the clip itself, or a small value.
                     double dropoutTransition = Math.Min(clipDuration.TotalSeconds > 0.1 ? 0.1 : 0, _videoOptions.TransitionDurationSeconds);
 
-                    audioFilterGraphPart =
-                        $"[3:a]volume={musicVolume},aloop=loop=-1:size=2000000000[bgm_looped];" + // Loop bg music
-                        $"[2:a][bgm_looped]amix=inputs=2:duration=first:dropout_transition={dropoutTransition.ToString(CultureInfo.InvariantCulture)}[aout]"; // Mix
-                    finalAudioMapLabel = "[aout]"; // Use the mixed audio output
+                    filterComplexBuilder.Append( // Append to existing video filter graph
+                        $";[3:a]volume={musicVolume},aloop=loop=-1:size=2000000000[bgm_looped];" +
+                        $"[2:a][bgm_looped]amix=inputs=2:duration=first:dropout_transition={dropoutTransition.ToString(CultureInfo.InvariantCulture)}[aout_final]"
+                    );
+                    finalAudioMapLabel = "[aout_final]";
                 }
-
-                string fullFilterComplex = videoFilterGraph;
-                if (!string.IsNullOrWhiteSpace(audioFilterGraphPart))
+                else
                 {
-                    fullFilterComplex += (string.IsNullOrWhiteSpace(fullFilterComplex) ? "" : ";") + audioFilterGraphPart;
+                    // No music, explicitly pass through TTS audio [2:a] and label it for mapping
+                    filterComplexBuilder.Append($";[2:a]anull[aout_final]");
+                    finalAudioMapLabel = "[aout_final]";
                 }
 
                 var outputProcessor = inputArguments.OutputToFile(outputClipPath, true, options => {
@@ -117,9 +104,9 @@ namespace RedditVideoMaker.Core
                            .WithAudioCodec(AudioCodec.Aac)
                            .WithAudioBitrate(192)
                            .WithVideoBitrate(2500)
-                           .WithCustomArgument($"-filter_complex \"{fullFilterComplex}\"")
-                           .WithCustomArgument("-map [vout]") // Map the video output from the video filter graph
-                           .WithCustomArgument($"-map {finalAudioMapLabel}") // Map the correct audio stream (TTS or mixed)
+                           .WithCustomArgument($"-filter_complex \"{filterComplexBuilder.ToString()}\"")
+                           .WithCustomArgument($"-map \"{finalVideoMapLabel}\"")  // Map video output
+                           .WithCustomArgument($"-map \"{finalAudioMapLabel}\"") // Map audio output (either mixed or passthrough TTS)
                            .WithDuration(clipDuration)
                            .WithCustomArgument("-preset medium")
                            .UsingMultithreading(true)
@@ -130,7 +117,7 @@ namespace RedditVideoMaker.Core
 
                 if (success)
                 {
-                    Console.WriteLine($"VideoService: Clip with background (and music: {useBackgroundMusic}) successfully created: {outputClipPath}");
+                    Console.WriteLine($"VideoService: Clip with background (music: {useBackgroundMusic}) successfully created: {outputClipPath}");
                     return true;
                 }
                 else
@@ -147,6 +134,7 @@ namespace RedditVideoMaker.Core
             }
         }
 
+        // ... ConcatenateVideosAsync method remains the same ...
         public async Task<bool> ConcatenateVideosAsync(List<string> videoClipPaths, string outputVideoPath)
         {
             if (videoClipPaths == null || !videoClipPaths.Any()) { Console.Error.WriteLine("VideoService Error: No video clips for concatenation."); return false; }
@@ -212,13 +200,15 @@ namespace RedditVideoMaker.Core
                         transitionDuration = Math.Min(transitionDuration, clipDurations[i].TotalSeconds / 2.01);
                         transitionDuration = Math.Min(transitionDuration, clipDurations[i + 1].TotalSeconds / 2.01);
                     }
-                    transitionDuration = Math.Max(0.01, transitionDuration); // Ensure a tiny positive duration
+                    transitionDuration = Math.Max(0.01, transitionDuration);
+
 
                     if (transitionDuration <= 0.01 && videoClipPaths.Count > 1)
                     {
                         Console.WriteLine("VideoService Warning: Calculated transition duration too short or zero. Switching to simple concat for this operation.");
                         return await ConcatenateWithoutTransitions(arguments, videoClipPaths, outputVideoPath);
                     }
+
 
                     for (int i = 0; i < videoClipPaths.Count - 1; i++)
                     {
