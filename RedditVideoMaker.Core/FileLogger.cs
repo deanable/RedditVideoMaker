@@ -1,121 +1,117 @@
 ﻿// FileLogger.cs (in RedditVideoMaker.Core project)
 using System;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Globalization;
 
 namespace RedditVideoMaker.Core
 {
     public static class FileLogger
     {
-        private static string _logDirectory = "logs"; // Default
+        private static string _logDirectory = "logs";
         private static string _logFileNameFormat = "app_run_{0:yyyy-MM-dd}.log";
-        private static StreamWriter? _logWriter;
-        private static TextWriter? _originalOut = Console.Out; // Capture original streams immediately
-        private static TextWriter? _originalError = Console.Error;
-        private static bool _isInitialized = false;
+        private static StreamWriter? _logStreamWriter;
+        private static TextWriter? _originalConsoleOut;
+        private static TextWriter? _originalConsoleError;
+        private static bool _isInitializedAndLoggingToFile = false;
         private static ConsoleLogLevel _consoleLogLevel = ConsoleLogLevel.Detailed;
 
         private class DualWriter : TextWriter
         {
-            private readonly TextWriter _fileWriterInstance; // Renamed to avoid confusion
-            private readonly TextWriter? _consoleWriterInstance;
-            private readonly bool _isErrorWriter;
-            private volatile bool _isFileStreamDisposed = false; // Flag to indicate if file stream is disposed
+            private readonly TextWriter? _consoleStream;
+            private readonly StreamWriter? _fileStreamWriterInternal; // Keep a reference to the logger's stream writer
+            private readonly bool _isErrorStreamDualWriter;
 
-            public DualWriter(TextWriter fileWriter, TextWriter? consoleWriter, bool isErrorWriter = false)
+            // No _isFileStreamWriterDisposed flag needed here if FileLogger manages the StreamWriter lifecycle
+
+            public DualWriter(StreamWriter? fileStreamWriter, TextWriter? consoleStream, bool isErrorStream)
             {
-                _fileWriterInstance = fileWriter;
-                _consoleWriterInstance = consoleWriter;
-                _isErrorWriter = isErrorWriter;
+                _fileStreamWriterInternal = fileStreamWriter; // This is the shared _logStreamWriter from FileLogger
+                _consoleStream = consoleStream;
+                _isErrorStreamDualWriter = isErrorStream;
             }
 
-            public override Encoding Encoding => _fileWriterInstance?.Encoding ?? _consoleWriterInstance?.Encoding ?? Encoding.Default;
+            public override Encoding Encoding => _consoleStream?.Encoding ?? _fileStreamWriterInternal?.Encoding ?? Encoding.Default;
 
             private bool ShouldWriteToConsole()
             {
-                if (_consoleWriterInstance == null) return false;
+                if (_consoleStream == null) return false;
                 switch (FileLogger._consoleLogLevel)
                 {
                     case ConsoleLogLevel.Detailed: return true;
-                    case ConsoleLogLevel.Summary: return _isErrorWriter;
-                    case ConsoleLogLevel.ErrorsOnly: return _isErrorWriter;
+                    case ConsoleLogLevel.Summary: return _isErrorStreamDualWriter;
+                    case ConsoleLogLevel.ErrorsOnly: return _isErrorStreamDualWriter;
                     case ConsoleLogLevel.Quiet: return false;
                     default: return true;
                 }
             }
 
-            private void WriteInternal(string? s, bool appendNewLine)
-            {
-                if (!_isFileStreamDisposed)
-                {
-                    try
-                    {
-                        if (appendNewLine) _fileWriterInstance.WriteLine(s);
-                        else _fileWriterInstance.Write(s);
-                        _fileWriterInstance.Flush();
-                    }
-                    catch (ObjectDisposedException) { _isFileStreamDisposed = true; /* Don't try to write to file anymore */ }
-                    catch (Exception ex) { _originalError?.WriteLine($"FileLogger.DualWriter Error writing to file: {ex.Message}"); _isFileStreamDisposed = true; }
-                }
-
-                if (ShouldWriteToConsole())
-                {
-                    try
-                    {
-                        if (appendNewLine) _consoleWriterInstance?.WriteLine(s);
-                        else _consoleWriterInstance?.Write(s);
-                        _consoleWriterInstance?.Flush();
-                    }
-                    catch (ObjectDisposedException) { /* Original console stream was somehow disposed, unlikely if we don't dispose it */ }
-                    catch (Exception ex) { _originalError?.WriteLine($"FileLogger.DualWriter Error writing to console: {ex.Message}"); }
-                }
-            }
-
             public override void Write(char value) => WriteInternal(value.ToString(), false);
             public override void Write(string? value) => WriteInternal(value, false);
-            public override void WriteLine(string? value)
+            public override void WriteLine(string? value) => WriteInternal(value, true);
+
+            private void WriteInternal(string? value, bool isNewLine)
             {
-                // Timestamp is now added before calling this, or by a higher-level logger
-                // For simplicity, let's add it here if missing, or assume higher level handles it.
-                // Let's assume higher level (Program.cs messages) already include it for file consistency.
-                // For file logging, the timestamp is added when Console.WriteLine is called by our Initialize or main Program.
-                // We'll add it here for the file part of DualWriter for consistency.
-                string timedValue = $"[{DateTime.UtcNow:HH:mm:ss.fff}] {value}";
-                WriteInternal(timedValue, true); // For file
-                if (ShouldWriteToConsole()) _consoleWriterInstance?.WriteLine(value); // Original value for console
+                // Attempt to write to file if the main logger's stream writer is available
+                if (FileLogger._logStreamWriter != null && FileLogger._isInitializedAndLoggingToFile)
+                {
+                    try
+                    {
+                        string timedValue = $"[{DateTime.UtcNow:HH:mm:ss.fff UTC}] {value}";
+                        if (isNewLine) FileLogger._logStreamWriter.WriteLine(timedValue);
+                        else FileLogger._logStreamWriter.Write(timedValue);
+                        // AutoFlush is true on _logStreamWriter
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // If it's disposed, we can't log to file anymore.
+                        // This might happen if Dispose was called prematurely or concurrently.
+                        FileLogger._isInitializedAndLoggingToFile = false; // Stop further file logging attempts
+                        FileLogger._originalConsoleError?.WriteLine($"DualWriter: Attempted to write to disposed file log. Value: {value}");
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger._originalConsoleError?.WriteLine($"DualWriter Error (to file): {ex.Message}. Value: {value}");
+                        FileLogger._isInitializedAndLoggingToFile = false; // Stop further file logging attempts
+                    }
+                }
+
+                if (ShouldWriteToConsole() && _consoleStream != null)
+                {
+                    try
+                    {
+                        if (isNewLine) _consoleStream.WriteLine(value);
+                        else _consoleStream.Write(value);
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger._originalConsoleError?.WriteLine($"DualWriter Error (to console): {ex.Message}");
+                    }
+                }
             }
 
             public override void Flush()
             {
-                if (!_isFileStreamDisposed) try { _fileWriterInstance.Flush(); } catch { _isFileStreamDisposed = true; }
-                try { _consoleWriterInstance?.Flush(); } catch { /* ignore */ }
+                if (FileLogger._logStreamWriter != null && FileLogger._isInitializedAndLoggingToFile) try { FileLogger._logStreamWriter.Flush(); } catch { /* ignore */ }
+                if (_consoleStream != null) try { _consoleStream.Flush(); } catch { /* ignore */ }
             }
 
             protected override void Dispose(bool disposing)
             {
-                if (disposing)
-                {
-                    // This DualWriter instance itself might be disposed by .NET when Console.Out/Error are finalized.
-                    // We only explicitly created and own _fileWriterInstance (via _logWriter).
-                    if (!_isFileStreamDisposed)
-                    {
-                        try { _fileWriterInstance?.Dispose(); } catch { /* ignore */ }
-                        _isFileStreamDisposed = true;
-                    }
-                }
+                // This DualWriter does not own the _logStreamWriter.
+                // FileLogger.Dispose() is responsible for the _logStreamWriter.
+                // We only need to handle the base TextWriter disposal.
                 base.Dispose(disposing);
             }
         }
 
         public static void Initialize(string logDirectory, ConsoleLogLevel consoleLevel, string logFileNameFormat = "app_run_{0:yyyy-MM-dd}.log")
         {
-            if (_isInitialized) return;
+            _originalConsoleOut = Console.Out;
+            _originalConsoleError = Console.Error;
 
-            // Use original streams for initial logging in case of failure
-            _originalOut = Console.Out;
-            _originalError = Console.Error;
+            if (_isInitializedAndLoggingToFile) return;
 
             _logDirectory = logDirectory;
             _logFileNameFormat = logFileNameFormat;
@@ -126,67 +122,66 @@ namespace RedditVideoMaker.Core
             {
                 if (string.IsNullOrWhiteSpace(_logDirectory))
                 {
-                    _originalError.WriteLine("FileLogger Init Error: Log directory path is null or empty. Using default 'logs' in AppContext.BaseDirectory.");
-                    _logDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
+                    _logDirectory = Path.Combine(AppContext.BaseDirectory, "logs_default");
+                    _originalConsoleError.WriteLine($"FileLogger Init Warning: Log directory was null/empty, using default: {_logDirectory}");
                 }
-
-                if (!Path.IsPathRooted(_logDirectory)) // Ensure directory is absolute
+                else if (!Path.IsPathRooted(_logDirectory))
                 {
                     _logDirectory = Path.Combine(AppContext.BaseDirectory, _logDirectory);
                 }
 
-                _originalOut.WriteLine($"FileLogger: Attempting to initialize. Log directory: {_logDirectory}");
+                _originalConsoleOut.WriteLine($"FileLogger: Initializing. Target log directory: {_logDirectory}");
 
                 if (!Directory.Exists(_logDirectory))
                 {
-                    _originalOut.WriteLine($"FileLogger: Creating log directory: {_logDirectory}");
+                    _originalConsoleOut.WriteLine($"FileLogger: Creating log directory: {_logDirectory}");
                     Directory.CreateDirectory(_logDirectory);
                 }
 
                 logFilePath = Path.Combine(_logDirectory, string.Format(_logFileNameFormat, DateTime.UtcNow));
-                _originalOut.WriteLine($"FileLogger: Log file path will be: {logFilePath}");
+                _originalConsoleOut.WriteLine($"FileLogger: Attempting to create/append log file: {logFilePath}");
 
                 var fileStream = new FileStream(logFilePath, FileMode.Append, FileAccess.Write, FileShare.Read);
-                _logWriter = new StreamWriter(fileStream) { AutoFlush = true };
+                _logStreamWriter = new StreamWriter(fileStream) { AutoFlush = true };
 
                 TextWriter? actualConsoleOut = null;
                 TextWriter? actualConsoleError = null;
 
                 switch (_consoleLogLevel)
                 {
-                    case ConsoleLogLevel.Detailed:
-                        actualConsoleOut = _originalOut; actualConsoleError = _originalError; break;
-                    case ConsoleLogLevel.Summary:
-                    case ConsoleLogLevel.ErrorsOnly:
-                        actualConsoleOut = null; actualConsoleError = _originalError; break;
-                    case ConsoleLogLevel.Quiet:
-                        actualConsoleOut = null; actualConsoleError = null; break;
+                    case ConsoleLogLevel.Detailed: actualConsoleOut = _originalConsoleOut; actualConsoleError = _originalConsoleError; break;
+                    case ConsoleLogLevel.Summary: actualConsoleOut = null; actualConsoleError = _originalConsoleError; break; // Only errors to console
+                    case ConsoleLogLevel.ErrorsOnly: actualConsoleOut = null; actualConsoleError = _originalConsoleError; break;
+                    case ConsoleLogLevel.Quiet: actualConsoleOut = null; actualConsoleError = null; break;
                 }
 
-                Console.SetOut(new DualWriter(_logWriter, actualConsoleOut, false));
-                Console.SetError(new DualWriter(_logWriter, actualConsoleError, true));
+                Console.SetOut(new DualWriter(_logStreamWriter, actualConsoleOut, false));
+                Console.SetError(new DualWriter(_logStreamWriter, actualConsoleError, true));
 
-                _isInitialized = true;
+                _isInitializedAndLoggingToFile = true;
                 Console.WriteLine($"FileLogger Initialized. ConsoleOutputLevel: {_consoleLogLevel}. Logging to: {logFilePath}");
             }
             catch (Exception ex)
             {
-                _isInitialized = false; // Ensure it's false if init fails
-                Console.SetOut(_originalOut); // Restore originals if anything went wrong with redirection
-                Console.SetError(_originalError);
-                System.Console.Error.WriteLine($"CRITICAL FileLogger Error: Failed to initialize. Logging will ONLY go to console. Exception: {ex.ToString()}");
-                System.Console.Error.WriteLine($"Attempted log directory: {logDirectory}, Attempted log file: {logFilePath}");
+                _isInitializedAndLoggingToFile = false;
 
-                _logWriter?.Dispose(); // Clean up if partially created
-                _logWriter = null;
+                if (Console.Out is DualWriter && _originalConsoleOut != null) Console.SetOut(_originalConsoleOut);
+                if (Console.Error is DualWriter && _originalConsoleError != null) Console.SetError(_originalConsoleError);
+
+                System.Console.Error.WriteLine($"CRITICAL FileLogger Error: Failed to initialize file logging. All logs will go to console only. Exception: {ex.ToString()}");
+                System.Console.Error.WriteLine($"Attempted log directory: {_logDirectory}, Attempted log file: {logFilePath}");
+
+                _logStreamWriter?.Dispose();
+                _logStreamWriter = null;
             }
         }
 
         public static void CleanupOldLogFiles(int retentionDays)
         {
-            if (!_isInitialized || _logWriter == null || retentionDays <= 0)
+            if (!_isInitializedAndLoggingToFile || string.IsNullOrWhiteSpace(_logDirectory) || retentionDays <= 0)
             {
-                if (!_isInitialized) Console.Error.WriteLine("FileLogger: CleanupOldLogFiles called before successful Initialize or after Dispose.");
+                if (!_isInitializedAndLoggingToFile && _originalConsoleError != null) _originalConsoleError.WriteLine("FileLogger: CleanupOldLogFiles called but logger not successfully initialized for file output.");
+                else if (!_isInitializedAndLoggingToFile) System.Console.Error.WriteLine("FileLogger: CleanupOldLogFiles called but logger not successfully initialized for file output (original error stream unavailable).");
                 return;
             }
 
@@ -194,8 +189,14 @@ namespace RedditVideoMaker.Core
             // ... (cleanup logic remains the same) ...
             try
             {
+                if (!Directory.Exists(_logDirectory))
+                {
+                    Console.WriteLine($"FileLogger: Log directory '{_logDirectory}' does not exist. Nothing to clean up.");
+                    return;
+                }
+
                 var files = Directory.GetFiles(_logDirectory, "*.log");
-                string prefix = _logFileNameFormat.Substring(0, _logFileNameFormat.IndexOf('{'));
+                string prefix = _logFileNameFormat.Substring(0, _logFileNameFormat.IndexOf('{')).TrimEnd('_');
                 string suffix = _logFileNameFormat.Substring(_logFileNameFormat.IndexOf('}') + 1);
 
                 foreach (var file in files)
@@ -206,6 +207,8 @@ namespace RedditVideoMaker.Core
                         if (fileNameOnly.StartsWith(prefix) && fileNameOnly.EndsWith(suffix))
                         {
                             string dateString = fileNameOnly.Substring(prefix.Length, fileNameOnly.Length - prefix.Length - suffix.Length);
+                            if (dateString.Contains("_")) dateString = dateString.Substring(0, dateString.IndexOf('_'));
+
                             if (DateTime.TryParseExact(dateString, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime fileDate))
                             {
                                 if (fileDate.ToUniversalTime().Date < DateTime.UtcNow.AddDays(-retentionDays).Date)
@@ -225,30 +228,46 @@ namespace RedditVideoMaker.Core
 
         public static void Dispose()
         {
-            if (_isInitialized)
+            // Log shutdown message *before* restoring original writers, so it goes to file (if still possible)
+            if (_isInitializedAndLoggingToFile && _logStreamWriter != null)
             {
-                Console.WriteLine($"FileLogger Shutting Down. Restoring original console writers.");
-
-                TextWriter? currentOut = Console.Out;
-                TextWriter? currentError = Console.Error;
-
-                if (_originalOut != null) Console.SetOut(_originalOut);
-                if (_originalError != null) Console.SetError(_originalError);
-
-                // Dispose the DualWriter instances if they were set, which in turn disposes the _logWriter
-                (currentOut as IDisposable)?.Dispose();
-                (currentError as IDisposable)?.Dispose(); // Only if currentError is different from currentOut
-
-                // _logWriter is disposed by DualWriter, so just nullify it here after restoring originals.
-                // However, to be absolutely safe, if DualWriter's Dispose didn't nullify _logWriter for some reason
-                // or if redirection failed, explicitly try disposing _logWriter if it's not already the same as currentOut's _fileWriter.
-                // This part is tricky. DualWriter's Dispose *should* handle _logWriter.
-                // For simplicity, let's rely on DualWriter's Dispose logic.
-                _logWriter = null; // It's disposed via DualWriter
-                _isInitialized = false;
-                // _originalOut = null; // Don't nullify originals, they are the system's
-                // _originalError = null;
+                try
+                {
+                    Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss UTC}] FileLogger Shutting Down. Restoring original console writers.");
+                    _logStreamWriter.Flush(); // Ensure final messages are written
+                }
+                catch (ObjectDisposedException) { /* _logStreamWriter already disposed, can't log shutdown message to file */ }
+                catch (Exception ex) { (_originalConsoleError ?? System.Console.Error).WriteLine($"FileLogger: Error during final flush before dispose: {ex.Message}"); }
             }
+
+            // Restore original console writers first, regardless of logger state
+            if (_originalConsoleOut != null && (Console.Out is DualWriter || Console.Out != _originalConsoleOut))
+            {
+                Console.SetOut(_originalConsoleOut);
+            }
+            if (_originalConsoleError != null && (Console.Error is DualWriter || Console.Error != _originalConsoleError))
+            {
+                Console.SetError(_originalConsoleError);
+            }
+
+            // Now, safely dispose the log writer
+            if (_logStreamWriter != null)
+            {
+                try
+                {
+                    _logStreamWriter.Close(); // Close also calls Dispose on the underlying stream
+                }
+                catch (Exception ex)
+                {
+                    // Use System.Console here as our redirection is reverted
+                    System.Console.Error.WriteLine($"FileLogger Error during _logStreamWriter.Close(): {ex.Message}");
+                }
+                finally
+                {
+                    _logStreamWriter = null;
+                }
+            }
+            _isInitializedAndLoggingToFile = false; // Mark as fully disposed
         }
     }
 }

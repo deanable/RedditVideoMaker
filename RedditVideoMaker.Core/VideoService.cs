@@ -21,8 +21,21 @@ namespace RedditVideoMaker.Core
         public VideoService(IOptions<VideoOptions> videoOptions)
         {
             _videoOptions = videoOptions.Value;
+            // GlobalFFOptions (like BinaryFolder for ffmpeg executables) should be configured 
+            // in Program.cs or a similar application startup location.
         }
 
+        /// <summary>
+        /// Creates a video clip by overlaying an image (card) onto a background video, 
+        /// synchronized with TTS audio, and optionally mixing in background music.
+        /// </summary>
+        /// <param name="backgroundVideoPath">Path to the looping visual background video.</param>
+        /// <param name="overlayCardPath">Path to the image card (e.g., comment image).</param>
+        /// <param name="ttsAudioPath">Path to the TTS audio file for this clip.</param>
+        /// <param name="outputClipPath">Path to save the output video clip.</param>
+        /// <param name="finalVideoWidth">Width of the final output video clip.</param>
+        /// <param name="finalVideoHeight">Height of the final output video clip.</param>
+        /// <returns>True if successful, false otherwise.</returns>
         public async Task<bool> CreateClipWithBackgroundAsync(
             string backgroundVideoPath,
             string overlayCardPath,
@@ -42,8 +55,8 @@ namespace RedditVideoMaker.Core
                 string? directory = Path.GetDirectoryName(outputClipPath);
                 if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory)) Directory.CreateDirectory(directory);
 
-                IMediaAnalysis audioInfo = await FFProbe.AnalyseAsync(ttsAudioPath);
-                TimeSpan clipDuration = audioInfo.Duration;
+                IMediaAnalysis ttsAudioInfo = await FFProbe.AnalyseAsync(ttsAudioPath);
+                TimeSpan clipDuration = ttsAudioInfo.Duration;
                 if (clipDuration <= TimeSpan.Zero) { Console.Error.WriteLine($"VideoService Error: Invalid audio duration for {ttsAudioPath}."); return false; }
 
                 Console.WriteLine($"VideoService: Creating clip '{Path.GetFileName(outputClipPath)}'. Duration: {clipDuration}, Output Size: {finalVideoWidth}x{finalVideoHeight}");
@@ -63,15 +76,14 @@ namespace RedditVideoMaker.Core
                 inputArguments.AddFileInput(ttsAudioPath); // Input 2: TTS Audio
 
                 var filterComplexBuilder = new StringBuilder();
-                string finalVideoMapLabel = "[vout]";
-                string finalAudioMapLabel;
-
                 // Video part of the filter graph (always present)
                 filterComplexBuilder.Append(
                     $"[0:v]scale={finalVideoWidth}:{finalVideoHeight}:force_original_aspect_ratio=decrease,pad={finalVideoWidth}:{finalVideoHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[bg];" +
                     $"[1:v]scale='iw*min(1,min({finalVideoWidth}*0.9/iw,{finalVideoHeight}*0.8/ih))':-1,format=rgba[fg];" +
-                    $"[bg][fg]overlay=(W-w)/2:(H-h)/2{finalVideoMapLabel}"
+                    $"[bg][fg]overlay=(W-w)/2:(H-h)/2[vout]" // Video output stream labeled [vout]
                 );
+
+                string finalAudioMapLabel;
 
                 bool useBackgroundMusic = !string.IsNullOrWhiteSpace(_videoOptions.BackgroundMusicFilePath) &&
                                           File.Exists(_videoOptions.BackgroundMusicFilePath) &&
@@ -84,13 +96,18 @@ namespace RedditVideoMaker.Core
                         opt => opt.WithCustomArgument("-stream_loop -1")); // Input 3: Background Music (looped)
 
                     string musicVolume = _videoOptions.BackgroundMusicVolume.ToString(CultureInfo.InvariantCulture);
-                    double dropoutTransition = Math.Min(clipDuration.TotalSeconds > 0.1 ? 0.1 : 0, _videoOptions.TransitionDurationSeconds);
+                    // For amix, dropout_transition should ideally be less than the shortest audio segment if it's very short.
+                    // However, 'duration=first' makes the output as long as the TTS.
+                    // A small dropout transition can help smooth the end if music is cut short.
+                    double dropoutTransition = Math.Min(0.1, clipDuration.TotalSeconds / 10.0); // e.g. 10% of TTS duration, max 0.1s
+                    dropoutTransition = Math.Max(0.01, dropoutTransition); // ensure it's a small positive value
 
-                    filterComplexBuilder.Append( // Append to existing video filter graph
-                        $";[3:a]volume={musicVolume},aloop=loop=-1:size=2000000000[bgm_looped];" +
+                    // TTS is [2:a], Background Music is [3:a]
+                    filterComplexBuilder.Append( // Append to existing video filter graph with a semicolon
+                        $";[3:a]volume={musicVolume},aloop=loop=-1:size=2000000000[bgm_looped];" + // Loop bg music, large size for aloop
                         $"[2:a][bgm_looped]amix=inputs=2:duration=first:dropout_transition={dropoutTransition.ToString(CultureInfo.InvariantCulture)}[aout_final]"
                     );
-                    finalAudioMapLabel = "[aout_final]";
+                    finalAudioMapLabel = "[aout_final]"; // Use the mixed audio output
                 }
                 else
                 {
@@ -105,10 +122,10 @@ namespace RedditVideoMaker.Core
                            .WithAudioBitrate(192)
                            .WithVideoBitrate(2500)
                            .WithCustomArgument($"-filter_complex \"{filterComplexBuilder.ToString()}\"")
-                           .WithCustomArgument($"-map \"{finalVideoMapLabel}\"")  // Map video output
+                           .WithCustomArgument("-map [vout]")  // Map video output
                            .WithCustomArgument($"-map \"{finalAudioMapLabel}\"") // Map audio output (either mixed or passthrough TTS)
                            .WithDuration(clipDuration)
-                           .WithCustomArgument("-preset medium")
+                           .WithCustomArgument("-preset medium") // Balanced speed and quality
                            .UsingMultithreading(true)
                            .WithFastStart();
                 });
@@ -134,7 +151,6 @@ namespace RedditVideoMaker.Core
             }
         }
 
-        // ... ConcatenateVideosAsync method remains the same ...
         public async Task<bool> ConcatenateVideosAsync(List<string> videoClipPaths, string outputVideoPath)
         {
             if (videoClipPaths == null || !videoClipPaths.Any()) { Console.Error.WriteLine("VideoService Error: No video clips for concatenation."); return false; }
@@ -193,22 +209,21 @@ namespace RedditVideoMaker.Core
                 if (_videoOptions.EnableTransitions && videoClipPaths.Count > 1)
                 {
                     double accumulatedDurationBeforeTransitionPoint = 0;
-                    double transitionDuration = _videoOptions.TransitionDurationSeconds;
-
+                    // Calculate a safe transition duration once, based on all clips
+                    double safeGlobalTransitionDuration = _videoOptions.TransitionDurationSeconds;
                     for (int i = 0; i < clipDurations.Count - 1; i++)
                     {
-                        transitionDuration = Math.Min(transitionDuration, clipDurations[i].TotalSeconds / 2.01);
-                        transitionDuration = Math.Min(transitionDuration, clipDurations[i + 1].TotalSeconds / 2.01);
+                        safeGlobalTransitionDuration = Math.Min(safeGlobalTransitionDuration, clipDurations[i].TotalSeconds / 2.01);
+                        safeGlobalTransitionDuration = Math.Min(safeGlobalTransitionDuration, clipDurations[i + 1].TotalSeconds / 2.01);
                     }
-                    transitionDuration = Math.Max(0.01, transitionDuration);
+                    safeGlobalTransitionDuration = Math.Max(0.01, safeGlobalTransitionDuration);
 
-
-                    if (transitionDuration <= 0.01 && videoClipPaths.Count > 1)
+                    if (safeGlobalTransitionDuration <= 0.01 && videoClipPaths.Count > 1)
                     {
                         Console.WriteLine("VideoService Warning: Calculated transition duration too short or zero. Switching to simple concat for this operation.");
                         return await ConcatenateWithoutTransitions(arguments, videoClipPaths, outputVideoPath);
                     }
-
+                    Console.WriteLine($"VideoService: Using effective transition duration: {safeGlobalTransitionDuration}s for xfade/acrossfade.");
 
                     for (int i = 0; i < videoClipPaths.Count - 1; i++)
                     {
@@ -218,20 +233,20 @@ namespace RedditVideoMaker.Core
                         string videoOutStageLabel = (i == videoClipPaths.Count - 2) ? "[vout]" : $"[vtemp{i}]";
                         string audioOutStageLabel = (i == videoClipPaths.Count - 2) ? "[aout]" : $"[atemp{i}]";
 
-                        double xfadeOffset = accumulatedDurationBeforeTransitionPoint + (clipDurations[i].TotalSeconds - transitionDuration);
+                        double xfadeOffset = accumulatedDurationBeforeTransitionPoint + (clipDurations[i].TotalSeconds - safeGlobalTransitionDuration);
 
                         filterComplexBuilder.Append($"{currentVideoLabel}{nextVideoInputLabel}" +
                                                     $"xfade=transition=fade" +
-                                                    $":duration={transitionDuration.ToString(CultureInfo.InvariantCulture)}" +
+                                                    $":duration={safeGlobalTransitionDuration.ToString(CultureInfo.InvariantCulture)}" +
                                                     $":offset={xfadeOffset.ToString(CultureInfo.InvariantCulture)}{videoOutStageLabel};");
 
                         filterComplexBuilder.Append($"{currentAudioLabel}{nextAudioInputLabel}" +
-                                                    $"acrossfade=d={transitionDuration.ToString(CultureInfo.InvariantCulture)}{audioOutStageLabel};");
+                                                    $"acrossfade=d={safeGlobalTransitionDuration.ToString(CultureInfo.InvariantCulture)}{audioOutStageLabel};");
 
                         currentVideoLabel = videoOutStageLabel;
                         currentAudioLabel = audioOutStageLabel;
 
-                        accumulatedDurationBeforeTransitionPoint += clipDurations[i].TotalSeconds - transitionDuration;
+                        accumulatedDurationBeforeTransitionPoint += clipDurations[i].TotalSeconds - safeGlobalTransitionDuration;
                     }
                 }
                 else

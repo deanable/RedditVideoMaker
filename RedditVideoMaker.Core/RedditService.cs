@@ -2,7 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization; // For DateTime parsing
-using System.Linq; // For LINQ methods like OrderByDescending, FirstOrDefault, Take
+using System.Linq; // For LINQ methods like OrderByDescending, FirstOrDefault
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -26,7 +26,7 @@ namespace RedditVideoMaker.Core
 
             if (_client.DefaultRequestHeaders.UserAgent.Count == 0)
             {
-                _client.DefaultRequestHeaders.UserAgent.ParseAdd($"CsharpRedditBot/0.6 by YourRedditUsername (config: {_redditOptions.Subreddit})"); // Version bump
+                _client.DefaultRequestHeaders.UserAgent.ParseAdd($"CsharpRedditBot/0.6 by YourRedditUsername (config: {_redditOptions.Subreddit})");
                 _client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             }
         }
@@ -37,7 +37,18 @@ namespace RedditVideoMaker.Core
             Console.WriteLine($"RedditService: Fetching single post from URL: {url}");
             try
             {
-                var responseListings = await _client.GetFromJsonAsync<List<RedditListingResponse>>(url, _jsonOptions);
+                // Using GetAsync and then ReadFromJsonAsync for more control over error response
+                HttpResponseMessage response = await _client.GetAsync(url);
+                if (!response.IsSuccessStatusCode)
+                {
+                    Console.Error.WriteLine($"RedditService: HTTP Error fetching post {url}. Status: {response.StatusCode}. Reason: {response.ReasonPhrase}");
+                    // Optionally, read and log response content for debugging if needed, e.g., await response.Content.ReadAsStringAsync();
+                    return null;
+                }
+
+                // The response for comments endpoint is an array of two listings.
+                var responseListings = await response.Content.ReadFromJsonAsync<List<RedditListingResponse>>(_jsonOptions);
+
                 if (responseListings != null && responseListings.Any())
                 {
                     var postListing = responseListings[0];
@@ -50,22 +61,27 @@ namespace RedditVideoMaker.Core
                         }
                     }
                 }
-                Console.Error.WriteLine($"RedditService: Could not parse post data for {subreddit}/comments/{postId}");
+                Console.Error.WriteLine($"RedditService: Could not parse post data for {subreddit}/comments/{postId} from URL: {url}");
                 return null;
             }
             catch (HttpRequestException httpEx)
             {
-                Console.Error.WriteLine($"RedditService: HTTP Error fetching single post {subreddit}/comments/{postId}: {httpEx.StatusCode} - {httpEx.Message}");
+                Console.Error.WriteLine($"RedditService: HttpRequestException fetching single post {url}: {httpEx.Message} (StatusCode: {httpEx.StatusCode})");
                 return null;
             }
             catch (JsonException jsonEx)
             {
-                Console.Error.WriteLine($"RedditService: JSON Error parsing single post {subreddit}/comments/{postId}: {jsonEx.Message}");
+                Console.Error.WriteLine($"RedditService: JsonException parsing single post {url}: {jsonEx.Message} (Path: {jsonEx.Path}, Line: {jsonEx.LineNumber}, Pos: {jsonEx.BytePositionInLine})");
+                return null;
+            }
+            catch (NotSupportedException nsEx) // Can be thrown by ReadFromJsonAsync if content type is not JSON
+            {
+                Console.Error.WriteLine($"RedditService: NotSupportedException (likely invalid content type) parsing single post {url}: {nsEx.Message}");
                 return null;
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"RedditService: General Error fetching single post {subreddit}/comments/{postId}: {ex.Message}");
+                Console.Error.WriteLine($"RedditService: General Error fetching single post {url}: {ex.ToString()}"); // Log full exception details
                 return null;
             }
         }
@@ -113,16 +129,16 @@ namespace RedditVideoMaker.Core
 
                         if (meetsCriteria)
                         {
-                            selectedPostsResult.Add(specificPost); // Add the single specified post if it meets criteria (or if filters bypassed)
+                            selectedPostsResult.Add(specificPost);
                         }
                         else
                         {
                             Console.WriteLine($"RedditService: Specified post from URL does not meet all configured criteria and filters are not bypassed. Not processing.");
                         }
                     }
-                    else { Console.Error.WriteLine($"RedditService: Failed to fetch or parse post from URL: {_redditOptions.PostUrl}"); }
+                    // FetchSinglePostDataAsync already logs its errors
                 }
-                else { Console.Error.WriteLine($"RedditService: Invalid PostUrl format: {_redditOptions.PostUrl}"); }
+                // ParseRedditPostUrl already logs its errors
             }
             else
             {
@@ -130,7 +146,15 @@ namespace RedditVideoMaker.Core
                 string url = $"https://www.reddit.com/r/{_redditOptions.Subreddit}/{_redditOptions.PostId}/.json?limit={_redditOptions.SubredditPostsToScan}";
                 try
                 {
-                    RedditListingResponse? listingResponse = await _client.GetFromJsonAsync<RedditListingResponse>(url, _jsonOptions);
+                    HttpResponseMessage response = await _client.GetAsync(url);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.Error.WriteLine($"RedditService: HTTP Error fetching posts from {url}. Status: {response.StatusCode}. Reason: {response.ReasonPhrase}");
+                        return selectedPostsResult; // Return empty list
+                    }
+
+                    RedditListingResponse? listingResponse = await response.Content.ReadFromJsonAsync<RedditListingResponse>(_jsonOptions);
+
                     if (listingResponse?.Data?.Children != null)
                     {
                         var candidates = new List<RedditPostData>();
@@ -175,16 +199,18 @@ namespace RedditVideoMaker.Core
                         Console.WriteLine($"RedditService: Found {candidates.Count} candidate posts after all filters (BypassPostFilters: {_redditOptions.BypassPostFilters}).");
                         if (candidates.Any())
                         {
-                            // Select up to NumberOfVideosInBatch, ordered by score (or other criteria if desired)
                             selectedPostsResult.AddRange(candidates
-                                .OrderByDescending(p => p.Score) // Example: order by score
+                                .OrderByDescending(p => p.Score)
                                 .Take(_redditOptions.NumberOfVideosInBatch)
                                 .ToList());
                             Console.WriteLine($"RedditService: Selected {selectedPostsResult.Count} posts for batch processing.");
                         }
                     }
                 }
-                catch (Exception ex) { Console.Error.WriteLine($"RedditService: Error fetching posts from /r/{_redditOptions.Subreddit}: {ex.Message}"); }
+                catch (HttpRequestException httpEx) { Console.Error.WriteLine($"RedditService: HttpRequestException fetching posts from {url}: {httpEx.Message} (StatusCode: {httpEx.StatusCode})"); }
+                catch (JsonException jsonEx) { Console.Error.WriteLine($"RedditService: JsonException parsing posts from {url}: {jsonEx.Message}"); }
+                catch (NotSupportedException nsEx) { Console.Error.WriteLine($"RedditService: NotSupportedException (likely invalid content type) parsing posts from {url}: {nsEx.Message}"); }
+                catch (Exception ex) { Console.Error.WriteLine($"RedditService: General Error fetching posts from {url}: {ex.ToString()}"); }
             }
 
             if (!selectedPostsResult.Any())
@@ -206,7 +232,15 @@ namespace RedditVideoMaker.Core
 
             try
             {
-                List<RedditListingResponse>? responseListings = await _client.GetFromJsonAsync<List<RedditListingResponse>>(url, _jsonOptions);
+                HttpResponseMessage response = await _client.GetAsync(url);
+                if (!response.IsSuccessStatusCode)
+                {
+                    Console.Error.WriteLine($"RedditService: HTTP Error fetching comments from {url}. Status: {response.StatusCode}. Reason: {response.ReasonPhrase}");
+                    return null;
+                }
+
+                List<RedditListingResponse>? responseListings = await response.Content.ReadFromJsonAsync<List<RedditListingResponse>>(_jsonOptions);
+
                 if (responseListings != null && responseListings.Count > 1)
                 {
                     RedditListingResponse? commentListing = responseListings[1];
@@ -244,13 +278,13 @@ namespace RedditVideoMaker.Core
                         return comments;
                     }
                 }
-                Console.WriteLine($"RedditService: No comments found or error in comment response structure for post {postId}.");
+                Console.WriteLine($"RedditService: No comments found or error in comment response structure for post {postId} from URL: {url}.");
                 return new List<RedditCommentData>();
             }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"RedditService Error: Error fetching comments for {subreddit}/{postId}: {ex.Message}");
-            }
+            catch (HttpRequestException httpEx) { Console.Error.WriteLine($"RedditService: HttpRequestException fetching comments for {url}: {httpEx.Message} (StatusCode: {httpEx.StatusCode})"); }
+            catch (JsonException jsonEx) { Console.Error.WriteLine($"RedditService: JsonException parsing comments for {url}: {jsonEx.Message}"); }
+            catch (NotSupportedException nsEx) { Console.Error.WriteLine($"RedditService: NotSupportedException (likely invalid content type) parsing comments for {url}: {nsEx.Message}"); }
+            catch (Exception ex) { Console.Error.WriteLine($"RedditService: General Error fetching comments for {url}: {ex.ToString()}"); }
             return null;
         }
     }
