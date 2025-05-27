@@ -14,10 +14,11 @@ public class Program
 {
     public static async Task Main(string[] args)
     {
-        // Capture original console streams before FileLogger might redirect them
+        // Capture original console streams BEFORE any redirection by FileLogger
         TextWriter originalConsoleOut = Console.Out;
         TextWriter originalConsoleError = Console.Error;
 
+        // Initialize FileLogger as early as possible.
         var initialConfigForLogging = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
             .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
@@ -39,6 +40,7 @@ public class Program
         FileLogger.CleanupOldLogFiles(retentionDaysFromJson);
 
         Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC] Application Startup. Logging Initialized. Console Level: {consoleLogLevel}");
+        // --- End of Initial FileLogger Setup ---
 
         try
         {
@@ -48,6 +50,7 @@ public class Program
             { GlobalFFOptions.Configure(new FFOptions { BinaryFolder = ffmpegBinFolder }); Console.WriteLine($"FFMpegCore: Configured from: {ffmpegBinFolder}"); }
             else { Console.Error.WriteLine($"FFMpegCore Error: ffmpeg_bin or executables not found at {ffmpegBinFolder}. Using PATH if available."); }
 
+            // Reflecting the latest feature (Duplicate Uploads)
             Console.WriteLine("\nReddit Video Maker Bot C# - Step 28: Preventing Duplicate Uploads");
 
             IConfiguration configuration = initialConfigForLogging;
@@ -80,6 +83,7 @@ public class Program
             if (string.IsNullOrWhiteSpace(redditOptions.PostUrl) && string.IsNullOrWhiteSpace(redditOptions.Subreddit))
             { Console.Error.WriteLine("Error: Either PostUrl or Subreddit must be configured in RedditOptions in appsettings.json."); return; }
 
+
             Console.WriteLine($"Testing Mode Enabled: {generalOptions.IsInTestingModule}");
             Console.WriteLine($"Actual Console Output Level in use by FileLogger: {consoleLogLevel}");
             Console.WriteLine($"Duplicate Upload Check Enabled: {youtubeOptions.EnableDuplicateCheck}");
@@ -89,6 +93,7 @@ public class Program
 
             if (!generalOptions.IsInTestingModule && (string.IsNullOrWhiteSpace(youtubeOptions.ClientSecretJsonPath) || !File.Exists(youtubeOptions.ClientSecretJsonPath)))
             { Console.Error.WriteLine($"Error: YouTube ClientSecretJsonPath is not configured or file not found. This is required when not in testing mode."); return; }
+
 
             var redditService = serviceProvider.GetRequiredService<RedditService>();
             var ttsService = serviceProvider.GetRequiredService<TtsService>();
@@ -118,7 +123,6 @@ public class Program
                         continue;
                     }
 
-                    // Check if this post has already been processed (video generated and logged)
                     if (youtubeOptions.EnableDuplicateCheck && uploadTracker.HasPostBeenUploaded(selectedPost.Id!))
                     {
                         Console.WriteLine($"Post ID '{selectedPost.Id}' has already been processed according to the log '{youtubeOptions.UploadedPostsLogPath}'. Skipping.");
@@ -148,18 +152,25 @@ public class Program
                         if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
                         { finalVideoWidth = w; finalVideoHeight = h; }
                     }
+                    Console.WriteLine($"Using final video dimensions: {finalVideoWidth}x{finalVideoHeight}");
+                    Console.WriteLine($"Using card dimensions: {videoOptions.CardWidth}x{videoOptions.CardHeight}");
+                    Console.WriteLine($"Number of comments to include: {videoOptions.NumberOfCommentsToInclude}");
+                    Console.WriteLine($"Transitions Enabled: {videoOptions.EnableTransitions}, Duration: {videoOptions.TransitionDurationSeconds}s");
+                    Console.WriteLine($"Font Sizes (Content Target/Min/Max): {videoOptions.ContentTargetFontSize}/{videoOptions.ContentMinFontSize}/{videoOptions.ContentMaxFontSize}");
+                    Console.WriteLine($"Font Sizes (Metadata Target/Min/Max): {videoOptions.MetadataTargetFontSize}/{videoOptions.MetadataMinFontSize}/{videoOptions.MetadataMaxFontSize}");
+                    Console.WriteLine($"Cleanup Intermediate Files: {videoOptions.CleanUpIntermediateFiles}");
                     Console.WriteLine($"TTS Engine Configured (before Testing Mode override): {ttsOptions.Engine}");
 
-                    FontFamily? nullableMeasuringFontFamily = null;
-                    FontFamily tempFontFamilyHolder;
-                    if (SystemFonts.TryGet("DejaVu Sans", out tempFontFamilyHolder) && !string.IsNullOrEmpty(tempFontFamilyHolder.Name))
-                    { nullableMeasuringFontFamily = tempFontFamilyHolder; Console.WriteLine("Program.cs: Using 'DejaVu Sans' for text measurement."); }
-                    else if (SystemFonts.Families.Any())
+
+                    FontFamily? nullableMeasuringFontFamily = imageService.LoadedFontFamily;
+                    if (nullableMeasuringFontFamily == null)
                     {
-                        FontFamily firstAvailableSystemFont = SystemFonts.Families.First();
-                        if (!string.IsNullOrEmpty(firstAvailableSystemFont.Name)) { nullableMeasuringFontFamily = firstAvailableSystemFont; Console.WriteLine($"Program.cs: Warning - 'DejaVu Sans' not found. Using first available system font '{firstAvailableSystemFont.Name}' for text measurement."); }
+                        Console.Error.WriteLine("Program.cs: Critical - No font could be loaded by ImageService. Text splitting for self-text will be skipped or may be inaccurate.");
                     }
-                    if (nullableMeasuringFontFamily == null) { Console.Error.WriteLine("Program.cs: Critical - No usable system font found for text measurement."); }
+                    else
+                    {
+                        Console.WriteLine($"Program.cs: Using font '{nullableMeasuringFontFamily.Value.Name}' (from ImageService) for text measurement.");
+                    }
 
                     // --- Add Intro Clip if specified ---
                     if (!string.IsNullOrWhiteSpace(videoOptions.IntroVideoPath) && File.Exists(videoOptions.IntroVideoPath))
@@ -193,7 +204,7 @@ public class Program
                     // --- Process Post Self-Text as a Clip (with splitting) ---
                     if (!string.IsNullOrWhiteSpace(selectedPost.Selftext) && nullableMeasuringFontFamily != null)
                     {
-                        FontFamily actualMeasuringFontFamily = (FontFamily)nullableMeasuringFontFamily;
+                        FontFamily actualMeasuringFontFamily = nullableMeasuringFontFamily.Value;
                         Font selfTextMeasuringFont = actualMeasuringFontFamily.CreateFont(videoOptions.ContentTargetFontSize, FontStyle.Regular);
                         float textPadding = Math.Max(15f, Math.Min(videoOptions.CardWidth * 0.05f, videoOptions.CardHeight * 0.05f));
                         float selfTextCardContentWidth = videoOptions.CardWidth - (2 * textPadding);
@@ -230,7 +241,7 @@ public class Program
                     }
                     else if (nullableMeasuringFontFamily == null)
                     {
-                        Console.Error.WriteLine("Skipping self-text processing as no usable measuring font was available.");
+                        Console.Error.WriteLine("Skipping self-text processing as no usable measuring font was available from ImageService.");
                     }
 
                     // --- Process Comments as Clips ---
@@ -286,13 +297,11 @@ public class Program
                         {
                             Console.WriteLine($"Final video created for post {selectedPost.Id}: {finalVideoPath}");
 
-                            // Log the post ID if duplicate checking is enabled, AFTER successful video generation
                             if (youtubeOptions.EnableDuplicateCheck)
                             {
                                 await uploadTracker.AddPostIdToLogAsync(selectedPost.Id!);
                             }
 
-                            // --- Upload to YouTube (conditional on Testing Mode) ---
                             if (!generalOptions.IsInTestingModule)
                             {
                                 Console.WriteLine($"\n--- Attempting YouTube Upload for post {selectedPost.Id} ---");
@@ -310,8 +319,6 @@ public class Program
                                 {
                                     Console.WriteLine($"Successfully uploaded video! YouTube ID: {uploadedVideo.Id}");
                                     Console.WriteLine($"Watch it at: https://www.youtube.com/watch?v={uploadedVideo.Id}");
-                                    // AddPostIdToLogAsync was moved up to after successful video generation,
-                                    // so it logs even if YouTube upload is skipped in testing mode or fails.
                                 }
                                 else { Console.Error.WriteLine($"YouTube upload failed for post {selectedPost.Id}. Check previous logs."); }
                             }
@@ -336,11 +343,16 @@ public class Program
         }
         finally
         {
-            Console.WriteLine("\nEnd of processing.");
-            FileLogger.Dispose();
+            // This message will go to the log file (via the potentially still redirected Console.WriteLine)
+            // and also to the console if the level allows.
+            Console.WriteLine("\nEnd of processing. All tasks completed.");
+
+            FileLogger.Dispose(); // Restore original console streams
+
+            // This message will now go to the *actual* console screen because FileLogger has restored originals.
             originalConsoleOut.WriteLine("\nApplication finished. Press any key to exit.");
-            originalConsoleOut.Flush();
-            Console.ReadKey();
+            originalConsoleOut.Flush(); // Ensure it's written to the screen.
+            Console.ReadKey(); // Now uses original console stream for input.
         }
     }
 }

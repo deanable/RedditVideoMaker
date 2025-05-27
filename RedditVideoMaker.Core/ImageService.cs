@@ -3,77 +3,107 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Processing;
-using SixLabors.ImageSharp.PixelFormats;
-using SixLabors.ImageSharp.Drawing.Processing;
+using Microsoft.Extensions.Options;
 using SixLabors.Fonts;
-using Microsoft.Extensions.Options; // Required for IOptions
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Drawing.Processing;
+using SixLabors.ImageSharp.Formats.Png;
+using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
+using System.Globalization; // For CultureInfo in GetAdjustedFont if needed
 
 namespace RedditVideoMaker.Core
 {
     public class ImageService
     {
+        private readonly VideoOptions _videoOptions;
         private readonly FontCollection _fontCollection;
-        private readonly FontFamily? _defaultFontFamily;
-        private readonly VideoOptions _videoOptions; // To store video options including font sizes
-        private const string BundledFontFileName = "DejaVuSans.ttf";
-        private const string ExpectedBundledFontFamilyName = "DejaVu Sans";
 
-        public ImageService(IOptions<VideoOptions> videoOptions) // Inject VideoOptions
+        /// <summary>
+        /// Gets the FontFamily that was successfully loaded by the ImageService.
+        /// This can be used by other parts of the application (like Program.cs for TextUtilities)
+        /// to ensure consistent font metrics for text measurement.
+        /// Will be null if no font could be loaded.
+        /// </summary>
+        public FontFamily? LoadedFontFamily { get; private set; }
+
+        public ImageService(IOptions<VideoOptions> videoOptions)
         {
-            _videoOptions = videoOptions.Value; // Store the options
-
+            _videoOptions = videoOptions.Value;
             _fontCollection = new FontCollection();
-            FontFamily? loadedFont = null;
-            try
-            {
-                string executableLocation = AppContext.BaseDirectory;
-                string fontPath = Path.Combine(executableLocation, "Fonts", BundledFontFileName);
-                if (File.Exists(fontPath))
-                {
-                    _fontCollection.Add(fontPath);
-                    if (_fontCollection.TryGet(ExpectedBundledFontFamilyName, out FontFamily foundByName))
-                    {
-                        loadedFont = foundByName;
-                        Console.WriteLine($"ImageService: Successfully loaded bundled font '{ExpectedBundledFontFamilyName}' from {fontPath}");
-                    }
-                    else if (_fontCollection.Families.Any())
-                    {
-                        FontFamily firstFamilyInCollection = _fontCollection.Families.First();
-                        loadedFont = firstFamilyInCollection;
-                        Console.WriteLine($"ImageService: Loaded bundled font from {fontPath}, using actual family name '{firstFamilyInCollection.Name}'. (Expected name '{ExpectedBundledFontFamilyName}' might differ or wasn't found).");
-                    }
-                    else { Console.Error.WriteLine($"ImageService Warning: Added font file {fontPath} but could not retrieve any font family from it."); }
-                }
-                else { Console.Error.WriteLine($"ImageService Warning: Bundled font file not found at {fontPath}. Will attempt to use system fonts."); }
-            }
-            catch (Exception ex) { Console.Error.WriteLine($"ImageService Error: Failed to load bundled font. {ex.Message}. Will attempt to use system fonts."); }
+            LoadConfiguredFont();
+        }
 
-            _defaultFontFamily = loadedFont;
-            if (_defaultFontFamily == null)
+        private void LoadConfiguredFont()
+        {
+            // Attempt 1: Load primary font from configured file path
+            if (!string.IsNullOrWhiteSpace(_videoOptions.PrimaryFontFilePath))
             {
-                Console.WriteLine("ImageService: Bundled font not loaded. Attempting to use system fonts as fallback.");
-                FontFamily systemFont;
-                if (SystemFonts.TryGet("Arial", out systemFont)) _defaultFontFamily = systemFont;
-                else if (SystemFonts.TryGet("Verdana", out systemFont)) _defaultFontFamily = systemFont;
-                else if (SystemFonts.TryGet(ExpectedBundledFontFamilyName, out systemFont)) _defaultFontFamily = systemFont;
-                else if (SystemFonts.TryGet("Segoe UI", out systemFont)) _defaultFontFamily = systemFont;
-                else if (SystemFonts.TryGet("Calibri", out systemFont)) _defaultFontFamily = systemFont;
-                else if (SystemFonts.Families.Any())
+                string fontFilePath = Path.Combine(AppContext.BaseDirectory, _videoOptions.PrimaryFontFilePath);
+
+                if (File.Exists(fontFilePath))
                 {
-                    FontFamily firstSystemFont = SystemFonts.Families.First();
-                    _defaultFontFamily = firstSystemFont;
-                    Console.WriteLine($"ImageService Warning: Using first available system font: {firstSystemFont.Name}.");
+                    try
+                    {
+                        var tempCollection = new FontCollection();
+                        FontFamily loadedFromFile = tempCollection.Add(fontFilePath);
+                        if (!string.IsNullOrEmpty(loadedFromFile.Name)) // Ensure it's a valid font family
+                        {
+                            LoadedFontFamily = loadedFromFile;
+                            _fontCollection.Add(fontFilePath); // Add to the service's main collection
+                            // Corrected: Access .Name via .Value after confirming LoadedFontFamily is not null
+                            Console.WriteLine($"ImageService: Successfully loaded primary font '{LoadedFontFamily.Value.Name}' from '{fontFilePath}'.");
+                            return;
+                        }
+                        else
+                        {
+                            Console.Error.WriteLine($"ImageService Warning: Loaded font from '{fontFilePath}' but it has no name (invalid font family).");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"ImageService Warning: Failed to load primary font from '{fontFilePath}'. {ex.Message}");
+                    }
+                }
+                else
+                {
+                    Console.Error.WriteLine($"ImageService Warning: Primary font file not found at '{fontFilePath}'. Path configured: '{_videoOptions.PrimaryFontFilePath}'");
                 }
             }
-
-            if (_defaultFontFamily != null)
+            else
             {
-                FontFamily confirmedFontFamily = (FontFamily)_defaultFontFamily;
-                Console.WriteLine($"ImageService: Initialized. Using font: {confirmedFontFamily.Name}");
+                Console.WriteLine("ImageService: No PrimaryFontFilePath configured. Attempting fallbacks.");
             }
-            else { Console.Error.WriteLine("ImageService Critical: No font loaded. Text rendering will likely fail."); }
+
+            // Attempt 2: Load fallback font name from system fonts
+            if (!string.IsNullOrWhiteSpace(_videoOptions.FallbackFontName))
+            {
+                if (SystemFonts.TryGet(_videoOptions.FallbackFontName, out FontFamily fallbackFontFamily) && !string.IsNullOrEmpty(fallbackFontFamily.Name))
+                {
+                    LoadedFontFamily = fallbackFontFamily;
+                    Console.WriteLine($"ImageService: Using configured fallback system font '{LoadedFontFamily.Value.Name}'.");
+                    return;
+                }
+                else
+                {
+                    Console.Error.WriteLine($"ImageService Warning: Configured fallback font '{_videoOptions.FallbackFontName}' not found on system or is invalid.");
+                }
+            }
+
+            // Attempt 3: Default to first available system font
+            if (SystemFonts.Families.Any())
+            {
+                FontFamily firstSystemFont = SystemFonts.Families.First();
+                if (!string.IsNullOrEmpty(firstSystemFont.Name))
+                {
+                    LoadedFontFamily = firstSystemFont;
+                    Console.WriteLine($"ImageService: Using first available system font '{LoadedFontFamily.Value.Name}' as a last resort.");
+                    return;
+                }
+            }
+
+            Console.Error.WriteLine("ImageService CRITICAL: No fonts could be loaded (primary, fallback, or system default). Text rendering will likely fail.");
+            LoadedFontFamily = null;
         }
 
         public async Task<bool> CreateRedditContentCardAsync(
@@ -83,21 +113,16 @@ namespace RedditVideoMaker.Core
             string outputImagePath,
             int cardWidth,
             int cardHeight,
-            string backgroundColorString = "DarkSlateGray",
-            string fontColorString = "White",
-            string metadataFontColorString = "LightGray")
+            string backgroundColorHex,
+            string fontColorHex,
+            string metadataFontColorHex)
         {
-            if (string.IsNullOrWhiteSpace(mainText))
-            { Console.Error.WriteLine("ImageService Error: Main text for card cannot be empty."); return false; }
-            if (string.IsNullOrWhiteSpace(outputImagePath))
-            { Console.Error.WriteLine("ImageService Error: Output image path for card cannot be empty."); return false; }
-            if (_defaultFontFamily == null)
+            if (LoadedFontFamily == null || !LoadedFontFamily.HasValue) // Check HasValue for nullable struct
             {
-                Console.Error.WriteLine("ImageService Error: Default font family is not initialized. Cannot render text card.");
+                Console.Error.WriteLine("ImageService Error: Cannot create card because no valid font is loaded.");
                 return false;
             }
-
-            FontFamily activeFontFamily = (FontFamily)_defaultFontFamily;
+            FontFamily fontFamily = LoadedFontFamily.Value;
 
             try
             {
@@ -107,195 +132,104 @@ namespace RedditVideoMaker.Core
                     Directory.CreateDirectory(directory);
                 }
 
-                Color backgroundColor = Color.TryParse(backgroundColorString, out Color bgCol) ? bgCol : Color.DarkSlateGray;
-                Color mainFontColor = Color.TryParse(fontColorString, out Color textCol) ? textCol : Color.White;
-                Color metadataFontColor = Color.TryParse(metadataFontColorString, out Color metaCol) ? metaCol : Color.LightGray;
+                Color bgColor = Color.ParseHex(backgroundColorHex);
+                Color textColor = Color.ParseHex(fontColorHex);
+                Color metaColor = Color.ParseHex(metadataFontColorHex);
 
-                using (Image<Rgba32> image = new Image<Rgba32>(cardWidth, cardHeight))
+                float padding = Math.Max(15f, Math.Min(cardWidth * 0.05f, cardHeight * 0.05f));
+                float contentWidth = cardWidth - (2 * padding);
+                float currentY = padding;
+
+                using (var image = new Image<Rgba32>(cardWidth, cardHeight))
                 {
-                    image.Mutate(ctx => ctx.BackgroundColor(backgroundColor));
+                    image.Mutate(ctx => ctx.BackgroundColor(bgColor));
 
-                    float basePadding = Math.Max(15f, Math.Min(cardWidth * 0.05f, cardHeight * 0.05f));
-                    float currentY = basePadding;
-
-                    // --- Draw Author and Score ---
                     if (!string.IsNullOrWhiteSpace(author))
                     {
-                        float metadataFontSize = CalculateFontSizeForLine(
-                            activeFontFamily,
-                            cardWidth - (2 * basePadding),
-                            text: $"{author}{score}", // Text used for sizing estimation
-                            _videoOptions.MetadataTargetFontSize,
-                            _videoOptions.MetadataMinFontSize,
-                            _videoOptions.MetadataMaxFontSize,
-                            maxLines: 2); // Allow metadata to wrap to 2 lines if necessary
-                        Font metadataFont = activeFontFamily.CreateFont(metadataFontSize, FontStyle.Italic);
-
-                        string authorScoreText = $"u/{author}";
+                        Font metadataFont = fontFamily.CreateFont(_videoOptions.MetadataTargetFontSize, FontStyle.Regular);
+                        string metadataText = $"u/{author}";
                         if (score.HasValue)
                         {
-                            authorScoreText += $" • {score.Value} points";
+                            metadataText += $" • {score.Value} points";
                         }
 
-                        var authorTextOptions = new RichTextOptions(metadataFont)
+                        var metadataTextOptions = new RichTextOptions(metadataFont)
                         {
-                            Origin = new PointF(basePadding, currentY),
-                            HorizontalAlignment = HorizontalAlignment.Left,
-                            VerticalAlignment = VerticalAlignment.Top,
-                            WrappingLength = cardWidth - (2 * basePadding),
-                            Dpi = 72f
+                            Origin = new PointF(padding, currentY),
+                            WrappingLength = contentWidth,
+                            HorizontalAlignment = HorizontalAlignment.Left
                         };
-                        image.Mutate(ctx => ctx.DrawText(authorTextOptions, authorScoreText, metadataFontColor));
-
-                        FontRectangle authorBounds = TextMeasurer.MeasureBounds(authorScoreText, authorTextOptions);
-                        currentY += authorBounds.Height + basePadding * 0.75f;
+                        image.Mutate(ctx => ctx.DrawText(metadataTextOptions, metadataText, metaColor));
+                        FontRectangle metadataBounds = TextMeasurer.MeasureBounds(metadataText, metadataTextOptions);
+                        currentY += metadataBounds.Height + (padding / 2);
                     }
 
-                    // --- Draw Main Text ---
-                    float mainTextRegionWidth = cardWidth - (2 * basePadding);
-                    float mainTextRegionHeight = cardHeight - currentY - basePadding;
+                    Font mainFont = GetAdjustedFont(
+                        fontFamily, mainText,
+                        _videoOptions.ContentTargetFontSize, _videoOptions.ContentMinFontSize, _videoOptions.ContentMaxFontSize,
+                        contentWidth, cardHeight - currentY - padding
+                    );
 
-                    if (mainTextRegionHeight > 20)
+                    Console.WriteLine($"ImageService: Drawing text card ({cardWidth}x{cardHeight}), Main Font: {fontFamily.Name}, Size: {mainFont.Size}pt (Target: {_videoOptions.ContentTargetFontSize}pt)");
+
+                    var mainTextOptions = new RichTextOptions(mainFont)
                     {
-                        float mainTextFontSize = CalculateFontSizeToFit(
-                            mainText,
-                            activeFontFamily,
-                            mainTextRegionWidth,
-                            mainTextRegionHeight,
-                            _videoOptions.ContentTargetFontSize,
-                            _videoOptions.ContentMinFontSize,
-                            _videoOptions.ContentMaxFontSize);
-                        Font mainFont = activeFontFamily.CreateFont(mainTextFontSize, FontStyle.Regular);
+                        Origin = new PointF(padding, currentY),
+                        WrappingLength = contentWidth,
+                        LineSpacing = 1.2f,
+                        HorizontalAlignment = HorizontalAlignment.Left,
+                        VerticalAlignment = VerticalAlignment.Top
+                    };
+                    image.Mutate(ctx => ctx.DrawText(mainTextOptions, mainText, textColor));
 
-                        var mainTextGraphicsOptions = new RichTextOptions(mainFont)
-                        {
-                            Origin = new PointF(basePadding, currentY),
-                            HorizontalAlignment = HorizontalAlignment.Left,
-                            VerticalAlignment = VerticalAlignment.Top,
-                            WrappingLength = mainTextRegionWidth,
-                            LineSpacing = 1.2f,
-                            Dpi = 72f
-                        };
-
-                        Console.WriteLine($"ImageService: Drawing text card ({cardWidth}x{cardHeight}), Main Font: {activeFontFamily.Name}, Size: {mainTextFontSize}pt (Target: {_videoOptions.ContentTargetFontSize}pt)");
-                        image.Mutate(ctx => ctx.DrawText(mainTextGraphicsOptions, mainText, mainFontColor));
-                    }
-                    else
-                    {
-                        Console.Error.WriteLine("ImageService Warning: Not enough space to render main text after metadata.");
-                    }
-
-                    await image.SaveAsPngAsync(outputImagePath);
+                    await image.SaveAsync(outputImagePath, new PngEncoder());
                     Console.WriteLine($"ImageService: Text card saved to {outputImagePath}");
+                    return true;
                 }
-                return true;
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"ImageService Error: Failed to create text card. {ex.Message}");
-                Console.Error.WriteLine($"Stack Trace: {ex.StackTrace}");
+                Console.Error.WriteLine(ex.StackTrace);
                 return false;
             }
         }
 
-        private float CalculateFontSizeForLine(FontFamily fontFamily, float regionWidth, string text,
-            float targetSize, float minSize, float maxSize, int maxLines = 1, float lineSpacing = 1.2f)
+        private Font GetAdjustedFont(FontFamily fontFamily, string text, float targetSize, float minSize, float maxSize, float maxWidth, float maxHeight)
         {
-            if (string.IsNullOrEmpty(text) || regionWidth <= 0 || targetSize <= 0) return Math.Clamp(minSize, 8f, maxSize);
+            float initialSize = Math.Clamp(targetSize, minSize, maxSize);
+            Font font = fontFamily.CreateFont(initialSize, FontStyle.Regular);
+            var textOptions = new RichTextOptions(font) { WrappingLength = maxWidth, Dpi = 72f, LineSpacing = 1.2f };
+            FontRectangle size = TextMeasurer.MeasureBounds(text, textOptions);
 
-            float currentFontSize = Math.Clamp(targetSize, minSize, maxSize);
-
-            for (int i = 0; i < 10; i++) // Limit iterations
+            while ((size.Height > maxHeight || size.Width > maxWidth) && font.Size > minSize)
             {
-                Font testFont = fontFamily.CreateFont(currentFontSize);
-                var textOptions = new RichTextOptions(testFont)
-                {
-                    WrappingLength = regionWidth,
-                    LineSpacing = lineSpacing, // Consider line spacing if maxLines > 1
-                    Dpi = 72f
-                };
-                FontRectangle textSize = TextMeasurer.MeasureBounds(text, textOptions);
-
-                // Calculate number of lines based on wrapped height
-                float actualLines = (textSize.Height / (currentFontSize * lineSpacing));
-
-                if (textSize.Width <= regionWidth && actualLines <= maxLines)
-                {
-                    // Fits, try to optimize towards target or max if current is smaller
-                    if (currentFontSize < targetSize && currentFontSize < maxSize)
-                    {
-                        float potentialSize = currentFontSize + 1f;
-                        testFont = fontFamily.CreateFont(potentialSize);
-                        textOptions.Font = testFont; // Update font in options for next measurement
-                        textSize = TextMeasurer.MeasureBounds(text, textOptions);
-                        actualLines = (textSize.Height / (potentialSize * lineSpacing));
-                        if (textSize.Width <= regionWidth && actualLines <= maxLines)
-                        {
-                            currentFontSize = potentialSize; // It still fits, so use larger
-                            continue; // Try to grow more if possible
-                        }
-                        // else, previous size was better
-                    }
-                    break; // Found a good fit or best possible enlargement
-                }
-
-                // If it doesn't fit, reduce size
-                if (currentFontSize <= minSize) break; // Already at min
-                currentFontSize = Math.Max(minSize, currentFontSize - 1f);
+                font = fontFamily.CreateFont(Math.Max(minSize, font.Size - 1), FontStyle.Regular);
+                textOptions.Font = font;
+                size = TextMeasurer.MeasureBounds(text, textOptions);
             }
-            return Math.Clamp(currentFontSize, minSize, maxSize);
-        }
 
-        private float CalculateFontSizeToFit(string text, FontFamily fontFamily, float regionWidth, float regionHeight,
-            float targetSize, float minSize, float maxSize, float lineSpacing = 1.2f)
-        {
-            if (string.IsNullOrEmpty(text) || regionWidth <= 10 || regionHeight <= 10) return Math.Clamp(minSize, 8f, maxSize);
-
-            float currentFontSize = Math.Clamp(targetSize, minSize, maxSize); // Start with target, clamped by min/max
-
-            // Iteratively adjust font size
-            for (int i = 0; i < 20; i++) // Limit iterations
+            while (size.Height <= maxHeight && size.Width <= maxWidth && font.Size < maxSize && font.Size < targetSize)
             {
-                Font testFont = fontFamily.CreateFont(currentFontSize);
-                var textOptions = new RichTextOptions(testFont)
-                {
-                    WrappingLength = regionWidth,
-                    LineSpacing = lineSpacing,
-                    Dpi = 72f
-                };
-                FontRectangle bounds = TextMeasurer.MeasureBounds(text, textOptions);
+                float nextPotentialSize = Math.Min(maxSize, font.Size + 1);
+                if (nextPotentialSize <= font.Size) break;
 
-                if (bounds.Height <= regionHeight && bounds.Width <= regionWidth) // It fits
-                {
-                    // If we started at target and it fits, this is good.
-                    // If we want to try to grow it towards max, we could add a small loop here.
-                    // For simplicity, if it fits when starting at target (or shrunk to fit), we accept.
-                    // If current size is below target, and target itself would fit, prefer target.
-                    if (currentFontSize < targetSize)
-                    {
-                        Font targetFont = fontFamily.CreateFont(targetSize);
-                        var targetOptions = new RichTextOptions(targetFont) { WrappingLength = regionWidth, LineSpacing = lineSpacing, Dpi = 72f };
-                        FontRectangle targetBounds = TextMeasurer.MeasureBounds(text, targetOptions);
-                        if (targetBounds.Height <= regionHeight && targetBounds.Width <= regionWidth)
-                        {
-                            currentFontSize = targetSize; // Prefer target if it fits
-                        }
-                    }
-                    break;
-                }
+                Font nextFont = fontFamily.CreateFont(nextPotentialSize, FontStyle.Regular);
+                var nextTextOptions = new RichTextOptions(nextFont) { WrappingLength = maxWidth, Dpi = 72f, LineSpacing = 1.2f };
+                FontRectangle nextSize = TextMeasurer.MeasureBounds(text, nextTextOptions);
 
-                if (currentFontSize <= minSize) break; // Already at min and doesn't fit
+                if (nextSize.Height > maxHeight || nextSize.Width > maxWidth) break;
 
-                // Reduce font size: more aggressively if far from fitting
-                float heightRatio = bounds.Height / regionHeight;
-                float reductionStep = 1f;
-                if (heightRatio > 1.5) reductionStep = currentFontSize * 0.2f; // Reduce by 20% if way too tall
-                else if (heightRatio > 1.1) reductionStep = currentFontSize * 0.1f; // Reduce by 10%
-
-                currentFontSize = Math.Max(minSize, currentFontSize - reductionStep);
-                if (currentFontSize < minSize) currentFontSize = minSize; // Ensure it doesn't go below min
+                font = nextFont;
+                size = nextSize;
+                if (font.Size >= targetSize) break;
             }
-            return Math.Clamp(currentFontSize, minSize, maxSize);
+
+            if (size.Height > maxHeight && font.Size == minSize)
+            {
+                Console.WriteLine($"ImageService Warning: Text '{text.Substring(0, Math.Min(30, text.Length))}...' might be truncated vertically even at min font size {minSize}pt. MeasuredHeight: {size.Height}, MaxHeight: {maxHeight}");
+            }
+            return font;
         }
     }
 }
