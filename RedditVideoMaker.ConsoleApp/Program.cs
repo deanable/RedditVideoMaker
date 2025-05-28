@@ -28,6 +28,7 @@ public class Program
 
     public static async Task Main(string[] args)
     {
+        // Capture original console streams BEFORE any redirection by FileLogger
         TextWriter originalConsoleOut = Console.Out;
         TextWriter originalConsoleError = Console.Error;
 
@@ -42,6 +43,7 @@ public class Program
         int retentionDaysFromJson = initialConfigForLogging.GetValue<int?>("GeneralOptions:LogFileRetentionDays") ?? 7;
         string consoleLevelStringFromJson = initialConfigForLogging.GetValue<string>("GeneralOptions:ConsoleOutputLevel") ?? "Detailed";
 
+        // This requires ConsoleLogLevel to be defined in RedditVideoMaker.Core namespace (likely in GeneralOptions.cs)
         if (!Enum.TryParse<ConsoleLogLevel>(consoleLevelStringFromJson, true, out ConsoleLogLevel consoleLogLevel))
         {
             consoleLogLevel = ConsoleLogLevel.Detailed;
@@ -96,9 +98,6 @@ public class Program
 
             // Resolve asset paths using the helper function and appBaseDirectory
             string resolvedBackgroundVideoPath = ResolveAssetPath(videoOptions.BackgroundVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths);
-            // Note: BackgroundMusicFilePath is resolved inside VideoService.cs now, which is better.
-            // We'll pass the raw configured paths for intro/outro to the main loop and let them be resolved just before use.
-            // This keeps Program.cs cleaner and path resolution closer to where the file is actually needed.
 
             Console.WriteLine($"Testing Mode Enabled: {generalOptions.IsInTestingModule}");
             Console.WriteLine($"Actual Console Output Level in use by FileLogger: {consoleLogLevel}");
@@ -111,7 +110,6 @@ public class Program
             if (string.IsNullOrWhiteSpace(resolvedBackgroundVideoPath) || !File.Exists(resolvedBackgroundVideoPath))
             { Console.Error.WriteLine($"Error: BackgroundVideoPath is not configured or file not found. Configured: '{videoOptions.BackgroundVideoPath}', Attempted: '{resolvedBackgroundVideoPath}'. Please check appsettings.json and ensure the file exists in the '{videoOptions.AssetsRootDirectory}' folder or is a valid absolute path."); return; }
 
-            // Warnings for other optional assets if path is specified but file not found after resolution
             if (!string.IsNullOrWhiteSpace(videoOptions.BackgroundMusicFilePath) &&
                 !File.Exists(ResolveAssetPath(videoOptions.BackgroundMusicFilePath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)) &&
                 videoOptions.BackgroundMusicVolume > 0)
@@ -138,6 +136,7 @@ public class Program
             var uploadTracker = serviceProvider.GetRequiredService<UploadTrackerService>();
 
             Console.WriteLine($"\nAttempting to select Reddit post(s) based on configuration...");
+            // GetTopPostsAsync now uses options injected into RedditService and returns a List
             List<RedditPostData> postsToProcess = await redditService.GetTopPostsAsync();
 
             if (postsToProcess == null || !postsToProcess.Any())
@@ -158,6 +157,7 @@ public class Program
                         continue;
                     }
 
+                    // Use youtubeOptions.EnableDuplicateCheck
                     if (youtubeOptions.EnableDuplicateCheck && uploadTracker.HasPostBeenUploaded(selectedPost.Id!))
                     {
                         Console.WriteLine($"Post ID '{selectedPost.Id}' has already been processed. Skipping.");
@@ -188,6 +188,7 @@ public class Program
                     }
                     Console.WriteLine($"TTS Engine Configured (before Testing Mode override): {ttsOptions.Engine}");
 
+                    // Use imageService.LoadedFontFamily
                     FontFamily? measuringFontFamily = imageService.LoadedFontFamily;
                     if (measuringFontFamily == null)
                     {
@@ -273,6 +274,7 @@ public class Program
 
                     // --- Process Comments as Clips ---
                     Console.WriteLine($"\nFetching comments for post ID: {selectedPost.Id} from subreddit /r/{selectedPost.Subreddit}...");
+                    // Corrected parameter name for GetCommentsAsync
                     int initialCommentFetchLimit = (videoOptions.NumberOfCommentsToInclude * 3) + 20;
                     List<RedditCommentData>? fetchedComments = await redditService.GetCommentsAsync(selectedPost.Subreddit!, selectedPost.Id!, commentFetchLimit: initialCommentFetchLimit);
 
@@ -325,6 +327,7 @@ public class Program
                         {
                             Console.WriteLine($"Final video created for post {selectedPost.Id}: {finalVideoPath}");
 
+                            // Use youtubeOptions.EnableDuplicateCheck
                             if (youtubeOptions.EnableDuplicateCheck)
                             {
                                 await uploadTracker.AddPostIdToLogAsync(selectedPost.Id!);
@@ -366,8 +369,13 @@ public class Program
                         else { Console.Error.WriteLine($"Failed to concatenate video clips for post {selectedPost.Id}."); }
                     }
                     else { Console.WriteLine($"No video clips were generated for post {selectedPost.Id} to concatenate."); }
-                }
+                } // End of foreach post loop
             }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"CRITICAL UNHANDLED EXCEPTION in Main: {ex.ToString()}");
+            System.Console.Error.WriteLine("Application terminated due to a critical error.");
         }
         finally
         {

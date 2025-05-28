@@ -10,7 +10,7 @@ using SixLabors.ImageSharp.Drawing.Processing;
 using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
-using System.Globalization; // For CultureInfo in GetAdjustedFont if needed
+using System.Globalization;
 
 namespace RedditVideoMaker.Core
 {
@@ -19,12 +19,6 @@ namespace RedditVideoMaker.Core
         private readonly VideoOptions _videoOptions;
         private readonly FontCollection _fontCollection;
 
-        /// <summary>
-        /// Gets the FontFamily that was successfully loaded by the ImageService.
-        /// This can be used by other parts of the application (like Program.cs for TextUtilities)
-        /// to ensure consistent font metrics for text measurement.
-        /// Will be null if no font could be loaded.
-        /// </summary>
         public FontFamily? LoadedFontFamily { get; private set; }
 
         public ImageService(IOptions<VideoOptions> videoOptions)
@@ -36,22 +30,19 @@ namespace RedditVideoMaker.Core
 
         private void LoadConfiguredFont()
         {
-            // Attempt 1: Load primary font from configured file path
             if (!string.IsNullOrWhiteSpace(_videoOptions.PrimaryFontFilePath))
             {
                 string fontFilePath = Path.Combine(AppContext.BaseDirectory, _videoOptions.PrimaryFontFilePath);
-
                 if (File.Exists(fontFilePath))
                 {
                     try
                     {
                         var tempCollection = new FontCollection();
                         FontFamily loadedFromFile = tempCollection.Add(fontFilePath);
-                        if (!string.IsNullOrEmpty(loadedFromFile.Name)) // Ensure it's a valid font family
+                        if (!string.IsNullOrEmpty(loadedFromFile.Name))
                         {
                             LoadedFontFamily = loadedFromFile;
-                            _fontCollection.Add(fontFilePath); // Add to the service's main collection
-                            // Corrected: Access .Name via .Value after confirming LoadedFontFamily is not null
+                            _fontCollection.Add(fontFilePath);
                             Console.WriteLine($"ImageService: Successfully loaded primary font '{LoadedFontFamily.Value.Name}' from '{fontFilePath}'.");
                             return;
                         }
@@ -75,7 +66,6 @@ namespace RedditVideoMaker.Core
                 Console.WriteLine("ImageService: No PrimaryFontFilePath configured. Attempting fallbacks.");
             }
 
-            // Attempt 2: Load fallback font name from system fonts
             if (!string.IsNullOrWhiteSpace(_videoOptions.FallbackFontName))
             {
                 if (SystemFonts.TryGet(_videoOptions.FallbackFontName, out FontFamily fallbackFontFamily) && !string.IsNullOrEmpty(fallbackFontFamily.Name))
@@ -90,7 +80,6 @@ namespace RedditVideoMaker.Core
                 }
             }
 
-            // Attempt 3: Default to first available system font
             if (SystemFonts.Families.Any())
             {
                 FontFamily firstSystemFont = SystemFonts.Families.First();
@@ -102,7 +91,7 @@ namespace RedditVideoMaker.Core
                 }
             }
 
-            Console.Error.WriteLine("ImageService CRITICAL: No fonts could be loaded (primary, fallback, or system default). Text rendering will likely fail.");
+            Console.Error.WriteLine("ImageService CRITICAL: No fonts could be loaded. Text rendering will fail.");
             LoadedFontFamily = null;
         }
 
@@ -113,11 +102,11 @@ namespace RedditVideoMaker.Core
             string outputImagePath,
             int cardWidth,
             int cardHeight,
-            string backgroundColorHex,
-            string fontColorHex,
-            string metadataFontColorHex)
+            string backgroundColorString, // Changed from backgroundColorHex
+            string fontColorString,       // Changed from fontColorHex
+            string metadataFontColorString) // Changed from metadataFontColorHex
         {
-            if (LoadedFontFamily == null || !LoadedFontFamily.HasValue) // Check HasValue for nullable struct
+            if (LoadedFontFamily == null || !LoadedFontFamily.HasValue)
             {
                 Console.Error.WriteLine("ImageService Error: Cannot create card because no valid font is loaded.");
                 return false;
@@ -132,9 +121,22 @@ namespace RedditVideoMaker.Core
                     Directory.CreateDirectory(directory);
                 }
 
-                Color bgColor = Color.ParseHex(backgroundColorHex);
-                Color textColor = Color.ParseHex(fontColorHex);
-                Color metaColor = Color.ParseHex(metadataFontColorHex);
+                // Use Color.TryParse for flexibility with named colors and hex codes
+                if (!Color.TryParse(backgroundColorString, out Color bgColor))
+                {
+                    Console.Error.WriteLine($"ImageService Warning: Could not parse CardBackgroundColor '{backgroundColorString}'. Defaulting to DarkSlateGray.");
+                    bgColor = Color.DarkSlateGray;
+                }
+                if (!Color.TryParse(fontColorString, out Color textColor))
+                {
+                    Console.Error.WriteLine($"ImageService Warning: Could not parse CardFontColor '{fontColorString}'. Defaulting to White.");
+                    textColor = Color.White;
+                }
+                if (!Color.TryParse(metadataFontColorString, out Color metaColor))
+                {
+                    Console.Error.WriteLine($"ImageService Warning: Could not parse CardMetadataFontColor '{metadataFontColorString}'. Defaulting to LightGray.");
+                    metaColor = Color.LightGray;
+                }
 
                 float padding = Math.Max(15f, Math.Min(cardWidth * 0.05f, cardHeight * 0.05f));
                 float contentWidth = cardWidth - (2 * padding);
