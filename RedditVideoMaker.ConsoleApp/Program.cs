@@ -12,13 +12,27 @@ using SixLabors.Fonts;
 
 public class Program
 {
+    // Helper function to resolve asset paths
+    private static string ResolveAssetPath(string? configuredPath, string assetsRootDirectory, string appBaseDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return string.Empty; // Return empty if no path is configured
+
+        // If the configured path is already absolute, use it directly
+        if (Path.IsPathRooted(configuredPath))
+            return configuredPath;
+
+        // Otherwise, treat it as relative to the assetsRootDirectory, which is relative to the appBaseDirectory
+        return Path.GetFullPath(Path.Combine(appBaseDirectory, assetsRootDirectory, configuredPath));
+    }
+
     public static async Task Main(string[] args)
     {
-        // Capture original console streams BEFORE any redirection by FileLogger
         TextWriter originalConsoleOut = Console.Out;
         TextWriter originalConsoleError = Console.Error;
 
-        // Initialize FileLogger as early as possible.
+        string appBaseDirectoryForPaths = AppContext.BaseDirectory;
+
         var initialConfigForLogging = new ConfigurationBuilder()
             .SetBasePath(Directory.GetCurrentDirectory())
             .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
@@ -34,24 +48,21 @@ public class Program
             originalConsoleError.WriteLine($"Warning: Invalid ConsoleOutputLevel '{consoleLevelStringFromJson}' in appsettings.json. Defaulting to '{consoleLogLevel}'.");
         }
 
-        string fullLogDirectoryPath = Path.Combine(AppContext.BaseDirectory, logDirFromJson);
+        string fullLogDirectoryPath = Path.Combine(appBaseDirectoryForPaths, logDirFromJson);
 
         FileLogger.Initialize(fullLogDirectoryPath, consoleLogLevel);
         FileLogger.CleanupOldLogFiles(retentionDaysFromJson);
 
-        Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC] Application Startup. Logging Initialized. Console Level: {consoleLogLevel}");
-        // --- End of Initial FileLogger Setup ---
+        Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC] Application Startup.");
 
         try
         {
-            string baseDirectory = AppContext.BaseDirectory;
-            string ffmpegBinFolder = Path.Combine(baseDirectory, "ffmpeg_bin");
+            string ffmpegBinFolder = Path.Combine(appBaseDirectoryForPaths, "ffmpeg_bin");
             if (Directory.Exists(ffmpegBinFolder) && File.Exists(Path.Combine(ffmpegBinFolder, "ffmpeg.exe")) && File.Exists(Path.Combine(ffmpegBinFolder, "ffprobe.exe")))
             { GlobalFFOptions.Configure(new FFOptions { BinaryFolder = ffmpegBinFolder }); Console.WriteLine($"FFMpegCore: Configured from: {ffmpegBinFolder}"); }
             else { Console.Error.WriteLine($"FFMpegCore Error: ffmpeg_bin or executables not found at {ffmpegBinFolder}. Using PATH if available."); }
 
-            // Reflecting the latest feature (Duplicate Uploads)
-            Console.WriteLine("\nReddit Video Maker Bot C# - Step 28: Preventing Duplicate Uploads");
+            Console.WriteLine("\nReddit Video Maker Bot C# - Step 29: Configurable Assets Folder");
 
             IConfiguration configuration = initialConfigForLogging;
 
@@ -83,13 +94,37 @@ public class Program
             if (string.IsNullOrWhiteSpace(redditOptions.PostUrl) && string.IsNullOrWhiteSpace(redditOptions.Subreddit))
             { Console.Error.WriteLine("Error: Either PostUrl or Subreddit must be configured in RedditOptions in appsettings.json."); return; }
 
+            // Resolve asset paths using the helper function and appBaseDirectory
+            string resolvedBackgroundVideoPath = ResolveAssetPath(videoOptions.BackgroundVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths);
+            // Note: BackgroundMusicFilePath is resolved inside VideoService.cs now, which is better.
+            // We'll pass the raw configured paths for intro/outro to the main loop and let them be resolved just before use.
+            // This keeps Program.cs cleaner and path resolution closer to where the file is actually needed.
 
             Console.WriteLine($"Testing Mode Enabled: {generalOptions.IsInTestingModule}");
             Console.WriteLine($"Actual Console Output Level in use by FileLogger: {consoleLogLevel}");
             Console.WriteLine($"Duplicate Upload Check Enabled: {youtubeOptions.EnableDuplicateCheck}");
+            Console.WriteLine($"Primary Font Path (relative to app): {videoOptions.PrimaryFontFilePath}");
+            Console.WriteLine($"Assets Root Directory (relative to app): {videoOptions.AssetsRootDirectory}");
+            Console.WriteLine($"Configured Background Video Path: {videoOptions.BackgroundVideoPath}, Resolved to: {resolvedBackgroundVideoPath}");
 
-            if (string.IsNullOrWhiteSpace(videoOptions.BackgroundVideoPath) || !File.Exists(videoOptions.BackgroundVideoPath))
-            { Console.Error.WriteLine($"Error: BackgroundVideoPath is not configured or file not found: '{videoOptions.BackgroundVideoPath}'. Please check appsettings.json."); return; }
+
+            if (string.IsNullOrWhiteSpace(resolvedBackgroundVideoPath) || !File.Exists(resolvedBackgroundVideoPath))
+            { Console.Error.WriteLine($"Error: BackgroundVideoPath is not configured or file not found. Configured: '{videoOptions.BackgroundVideoPath}', Attempted: '{resolvedBackgroundVideoPath}'. Please check appsettings.json and ensure the file exists in the '{videoOptions.AssetsRootDirectory}' folder or is a valid absolute path."); return; }
+
+            // Warnings for other optional assets if path is specified but file not found after resolution
+            if (!string.IsNullOrWhiteSpace(videoOptions.BackgroundMusicFilePath) &&
+                !File.Exists(ResolveAssetPath(videoOptions.BackgroundMusicFilePath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)) &&
+                videoOptions.BackgroundMusicVolume > 0)
+            { Console.Error.WriteLine($"Warning: BackgroundMusicFilePath is specified ('{videoOptions.BackgroundMusicFilePath}') but resolved file not found at '{ResolveAssetPath(videoOptions.BackgroundMusicFilePath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)}'. Background music will be skipped."); }
+
+            if (!string.IsNullOrWhiteSpace(videoOptions.IntroVideoPath) &&
+                !File.Exists(ResolveAssetPath(videoOptions.IntroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)))
+            { Console.Error.WriteLine($"Warning: IntroVideoPath is specified ('{videoOptions.IntroVideoPath}') but resolved file not found at '{ResolveAssetPath(videoOptions.IntroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)}'. Intro video will be skipped."); }
+
+            if (!string.IsNullOrWhiteSpace(videoOptions.OutroVideoPath) &&
+                !File.Exists(ResolveAssetPath(videoOptions.OutroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)))
+            { Console.Error.WriteLine($"Warning: OutroVideoPath is specified ('{videoOptions.OutroVideoPath}') but resolved file not found at '{ResolveAssetPath(videoOptions.OutroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)}'. Outro video will be skipped."); }
+
 
             if (!generalOptions.IsInTestingModule && (string.IsNullOrWhiteSpace(youtubeOptions.ClientSecretJsonPath) || !File.Exists(youtubeOptions.ClientSecretJsonPath)))
             { Console.Error.WriteLine($"Error: YouTube ClientSecretJsonPath is not configured or file not found. This is required when not in testing mode."); return; }
@@ -119,18 +154,17 @@ public class Program
 
                     if (string.IsNullOrWhiteSpace(selectedPost.Id) || string.IsNullOrWhiteSpace(selectedPost.Subreddit) || string.IsNullOrWhiteSpace(selectedPost.Title))
                     {
-                        Console.Error.WriteLine($"Skipping post {selectedPost.Id ?? "Unknown"} due to missing critical info (ID, Subreddit, or Title).");
+                        Console.Error.WriteLine($"Skipping post {selectedPost.Id ?? "Unknown"} due to missing critical info.");
                         continue;
                     }
 
                     if (youtubeOptions.EnableDuplicateCheck && uploadTracker.HasPostBeenUploaded(selectedPost.Id!))
                     {
-                        Console.WriteLine($"Post ID '{selectedPost.Id}' has already been processed according to the log '{youtubeOptions.UploadedPostsLogPath}'. Skipping.");
+                        Console.WriteLine($"Post ID '{selectedPost.Id}' has already been processed. Skipping.");
                         continue;
                     }
 
                     Console.WriteLine($"Processing Post: {selectedPost.Title} by {selectedPost.Author} (Score: {selectedPost.Score})");
-                    Console.WriteLine($"Post URL: https://www.reddit.com{selectedPost.Permalink}");
 
                     List<string> individualVideoClips = new List<string>();
                     List<string> intermediateFilesToClean = new List<string>();
@@ -152,31 +186,24 @@ public class Program
                         if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
                         { finalVideoWidth = w; finalVideoHeight = h; }
                     }
-                    Console.WriteLine($"Using final video dimensions: {finalVideoWidth}x{finalVideoHeight}");
-                    Console.WriteLine($"Using card dimensions: {videoOptions.CardWidth}x{videoOptions.CardHeight}");
-                    Console.WriteLine($"Number of comments to include: {videoOptions.NumberOfCommentsToInclude}");
-                    Console.WriteLine($"Transitions Enabled: {videoOptions.EnableTransitions}, Duration: {videoOptions.TransitionDurationSeconds}s");
-                    Console.WriteLine($"Font Sizes (Content Target/Min/Max): {videoOptions.ContentTargetFontSize}/{videoOptions.ContentMinFontSize}/{videoOptions.ContentMaxFontSize}");
-                    Console.WriteLine($"Font Sizes (Metadata Target/Min/Max): {videoOptions.MetadataTargetFontSize}/{videoOptions.MetadataMinFontSize}/{videoOptions.MetadataMaxFontSize}");
-                    Console.WriteLine($"Cleanup Intermediate Files: {videoOptions.CleanUpIntermediateFiles}");
                     Console.WriteLine($"TTS Engine Configured (before Testing Mode override): {ttsOptions.Engine}");
 
-
-                    FontFamily? nullableMeasuringFontFamily = imageService.LoadedFontFamily;
-                    if (nullableMeasuringFontFamily == null)
+                    FontFamily? measuringFontFamily = imageService.LoadedFontFamily;
+                    if (measuringFontFamily == null)
                     {
                         Console.Error.WriteLine("Program.cs: Critical - No font could be loaded by ImageService. Text splitting for self-text will be skipped or may be inaccurate.");
                     }
                     else
                     {
-                        Console.WriteLine($"Program.cs: Using font '{nullableMeasuringFontFamily.Value.Name}' (from ImageService) for text measurement.");
+                        Console.WriteLine($"Program.cs: Using font '{measuringFontFamily.Value.Name}' (from ImageService) for text measurement.");
                     }
 
                     // --- Add Intro Clip if specified ---
-                    if (!string.IsNullOrWhiteSpace(videoOptions.IntroVideoPath) && File.Exists(videoOptions.IntroVideoPath))
+                    string currentIntroPath = ResolveAssetPath(videoOptions.IntroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths);
+                    if (!string.IsNullOrWhiteSpace(currentIntroPath) && File.Exists(currentIntroPath))
                     {
-                        Console.WriteLine($"Adding intro clip: {videoOptions.IntroVideoPath}");
-                        individualVideoClips.Add(videoOptions.IntroVideoPath);
+                        Console.WriteLine($"Adding intro clip: {currentIntroPath}");
+                        individualVideoClips.Add(currentIntroPath);
                     }
 
                     // --- Process Post Title as a Clip ---
@@ -194,7 +221,7 @@ public class Program
                             titleForCard, selectedPost.Author, selectedPost.Score, titleCardPath,
                             videoOptions.CardWidth, videoOptions.CardHeight, videoOptions.CardBackgroundColor,
                             videoOptions.CardFontColor, videoOptions.CardMetadataFontColor) &&
-                        await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath!, titleCardPath, titleTtsPath, titleClipPath, finalVideoWidth, finalVideoHeight))
+                        await videoService.CreateClipWithBackgroundAsync(resolvedBackgroundVideoPath, titleCardPath, titleTtsPath, titleClipPath, finalVideoWidth, finalVideoHeight))
                     {
                         Console.WriteLine($"Title clip created: {titleClipPath}");
                         individualVideoClips.Add(titleClipPath);
@@ -202,9 +229,9 @@ public class Program
                     else { Console.Error.WriteLine($"Failed to process title clip for post {selectedPost.Id}."); }
 
                     // --- Process Post Self-Text as a Clip (with splitting) ---
-                    if (!string.IsNullOrWhiteSpace(selectedPost.Selftext) && nullableMeasuringFontFamily != null)
+                    if (!string.IsNullOrWhiteSpace(selectedPost.Selftext) && measuringFontFamily != null)
                     {
-                        FontFamily actualMeasuringFontFamily = nullableMeasuringFontFamily.Value;
+                        FontFamily actualMeasuringFontFamily = measuringFontFamily.Value;
                         Font selfTextMeasuringFont = actualMeasuringFontFamily.CreateFont(videoOptions.ContentTargetFontSize, FontStyle.Regular);
                         float textPadding = Math.Max(15f, Math.Min(videoOptions.CardWidth * 0.05f, videoOptions.CardHeight * 0.05f));
                         float selfTextCardContentWidth = videoOptions.CardWidth - (2 * textPadding);
@@ -227,7 +254,7 @@ public class Program
                             string pageIndicator = selfTextPagesForTts.Count > 1 ? $" (Page {selfTextPageIndex}/{selfTextPagesForTts.Count})" : "";
                             if (await ttsService.TextToSpeechAsync(selfTextPageContentForTts, selfTextPageTtsPath) &&
                                 await imageService.CreateRedditContentCardAsync(selfTextPageContentForCard + pageIndicator, null, null, selfTextPageCardPath, videoOptions.CardWidth, videoOptions.CardHeight, videoOptions.CardBackgroundColor, videoOptions.CardFontColor, videoOptions.CardMetadataFontColor) &&
-                                await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath!, selfTextPageCardPath, selfTextPageTtsPath, selfTextPageClipPath, finalVideoWidth, finalVideoHeight))
+                                await videoService.CreateClipWithBackgroundAsync(resolvedBackgroundVideoPath, selfTextPageCardPath, selfTextPageTtsPath, selfTextPageClipPath, finalVideoWidth, finalVideoHeight))
                             {
                                 Console.WriteLine($"Self-text clip (page {selfTextPageIndex}) created: {selfTextPageClipPath}");
                                 individualVideoClips.Add(selfTextPageClipPath);
@@ -239,7 +266,7 @@ public class Program
                     {
                         Console.WriteLine("No self-text for this post.");
                     }
-                    else if (nullableMeasuringFontFamily == null)
+                    else if (measuringFontFamily == null)
                     {
                         Console.Error.WriteLine("Skipping self-text processing as no usable measuring font was available from ImageService.");
                     }
@@ -269,7 +296,7 @@ public class Program
                             intermediateFilesToClean.Add(cTtsPath); intermediateFilesToClean.Add(cCardPath);
                             if (await ttsService.TextToSpeechAsync(cleanedCommentBodyForTts, cTtsPath) &&
                                 await imageService.CreateRedditContentCardAsync(commentBodyForCard, comment.Author, comment.Score, cCardPath, videoOptions.CardWidth, videoOptions.CardHeight, videoOptions.CardBackgroundColor, videoOptions.CardFontColor, videoOptions.CardMetadataFontColor) &&
-                                await videoService.CreateClipWithBackgroundAsync(videoOptions.BackgroundVideoPath!, cCardPath, cTtsPath, cClipPath, finalVideoWidth, finalVideoHeight))
+                                await videoService.CreateClipWithBackgroundAsync(resolvedBackgroundVideoPath, cCardPath, cTtsPath, cClipPath, finalVideoWidth, finalVideoHeight))
                             {
                                 Console.WriteLine($"Comment clip {idx} created: {cClipPath}");
                                 individualVideoClips.Add(cClipPath);
@@ -280,10 +307,11 @@ public class Program
                     else { Console.WriteLine("No comments found for the post (or none met score criteria)."); }
 
                     // --- Add Outro Clip if specified ---
-                    if (!string.IsNullOrWhiteSpace(videoOptions.OutroVideoPath) && File.Exists(videoOptions.OutroVideoPath))
+                    string currentOutroPath = ResolveAssetPath(videoOptions.OutroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths);
+                    if (!string.IsNullOrWhiteSpace(currentOutroPath) && File.Exists(currentOutroPath))
                     {
-                        Console.WriteLine($"Adding outro clip: {videoOptions.OutroVideoPath}");
-                        individualVideoClips.Add(videoOptions.OutroVideoPath);
+                        Console.WriteLine($"Adding outro clip: {currentOutroPath}");
+                        individualVideoClips.Add(currentOutroPath);
                     }
 
                     // --- Concatenate all video clips for the current post ---
@@ -338,21 +366,18 @@ public class Program
                         else { Console.Error.WriteLine($"Failed to concatenate video clips for post {selectedPost.Id}."); }
                     }
                     else { Console.WriteLine($"No video clips were generated for post {selectedPost.Id} to concatenate."); }
-                } // End of foreach post loop
+                }
             }
         }
         finally
         {
-            // This message will go to the log file (via the potentially still redirected Console.WriteLine)
-            // and also to the console if the level allows.
             Console.WriteLine("\nEnd of processing. All tasks completed.");
-
-            FileLogger.Dispose(); // Restore original console streams
-
-            // This message will now go to the *actual* console screen because FileLogger has restored originals.
-            originalConsoleOut.WriteLine("\nApplication finished. Press any key to exit.");
-            originalConsoleOut.Flush(); // Ensure it's written to the screen.
-            Console.ReadKey(); // Now uses original console stream for input.
+            FileLogger.Dispose();
+            System.Console.Out.WriteLine("\nApplication finished. Press any key to exit.");
+            System.Console.Out.Flush();
+            try { System.Console.ReadKey(); }
+            catch (InvalidOperationException ioex)
+            { System.Console.Error.WriteLine($"Error during Console.ReadKey(): {ioex.Message}"); await Task.Delay(5000); }
         }
     }
 }

@@ -35,15 +35,15 @@ namespace RedditVideoMaker.Core
         public string? BackgroundMusicFilePath { get; set; }
         public double BackgroundMusicVolume { get; set; } = 0.15;
 
-        // New properties for Step 29: Configurable Font
-        /// <summary>
-        /// Path to the primary font file (e.g., "Fonts/DejaVuSans.ttf"), relative to the application's execution directory.
-        /// </summary>
         public string PrimaryFontFilePath { get; set; } = "Fonts/DejaVuSans.ttf";
+        public string FallbackFontName { get; set; } = "Arial";
 
+        // New property for Step 29: Assets Folder
         /// <summary>
-        /// Name of a fallback font to try if the primary font file cannot be loaded (e.g., "Arial").
+        /// The root directory name for assets (e.g., "assets"), relative to the application execution path.
+        /// Paths like BackgroundVideoPath, BackgroundMusicFilePath, IntroVideoPath, OutroVideoPath
+        /// will be treated as relative to this directory if they are not absolute paths.
         /// </summary>
-        public string FallbackFontName { get; set; } = "Arial"; // A common system font
+        public string AssetsRootDirectory { get; set; } = "assets";
     }
 }
