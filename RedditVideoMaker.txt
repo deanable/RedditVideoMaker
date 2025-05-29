@@ -1,0 +1,2567 @@
+// FileLogger.cs (in RedditVideoMaker.Core project)
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Globalization;
+
+namespace RedditVideoMaker.Core
+{
+    public static class FileLogger
+    {
+        private static string _logDirectory = "logs";
+        private static string _logFileNameFormat = "app_run_{0:yyyy-MM-dd}.log";
+        private static StreamWriter? _logStreamWriter;
+        private static TextWriter? _originalConsoleOut;
+        private static TextWriter? _originalConsoleError;
+        private static bool _isInitializedAndLoggingToFile = false;
+        private static ConsoleLogLevel _consoleLogLevel = ConsoleLogLevel.Detailed;
+
+        private class DualWriter : TextWriter
+        {
+            private readonly TextWriter? _consoleStream;
+            private readonly StreamWriter? _fileStreamWriterInternal; // Keep a reference to the logger's stream writer
+            private readonly bool _isErrorStreamDualWriter;
+
+            // No _isFileStreamWriterDisposed flag needed here if FileLogger manages the StreamWriter lifecycle
+
+            public DualWriter(StreamWriter? fileStreamWriter, TextWriter? consoleStream, bool isErrorStream)
+            {
+                _fileStreamWriterInternal = fileStreamWriter; // This is the shared _logStreamWriter from FileLogger
+                _consoleStream = consoleStream;
+                _isErrorStreamDualWriter = isErrorStream;
+            }
+
+            public override Encoding Encoding => _consoleStream?.Encoding ?? _fileStreamWriterInternal?.Encoding ?? Encoding.Default;
+
+            private bool ShouldWriteToConsole()
+            {
+                if (_consoleStream == null) return false;
+                switch (FileLogger._consoleLogLevel)
+                {
+                    case ConsoleLogLevel.Detailed: return true;
+                    case ConsoleLogLevel.Summary: return _isErrorStreamDualWriter;
+                    case ConsoleLogLevel.ErrorsOnly: return _isErrorStreamDualWriter;
+                    case ConsoleLogLevel.Quiet: return false;
+                    default: return true;
+                }
+            }
+
+            public override void Write(char value) => WriteInternal(value.ToString(), false);
+            public override void Write(string? value) => WriteInternal(value, false);
+            public override void WriteLine(string? value) => WriteInternal(value, true);
+
+            private void WriteInternal(string? value, bool isNewLine)
+            {
+                // Attempt to write to file if the main logger's stream writer is available
+                if (FileLogger._logStreamWriter != null && FileLogger._isInitializedAndLoggingToFile)
+                {
+                    try
+                    {
+                        string timedValue = $"[{DateTime.UtcNow:HH:mm:ss.fff UTC}] {value}";
+                        if (isNewLine) FileLogger._logStreamWriter.WriteLine(timedValue);
+                        else FileLogger._logStreamWriter.Write(timedValue);
+                        // AutoFlush is true on _logStreamWriter
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // If it's disposed, we can't log to file anymore.
+                        // This might happen if Dispose was called prematurely or concurrently.
+                        FileLogger._isInitializedAndLoggingToFile = false; // Stop further file logging attempts
+                        FileLogger._originalConsoleError?.WriteLine($"DualWriter: Attempted to write to disposed file log. Value: {value}");
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger._originalConsoleError?.WriteLine($"DualWriter Error (to file): {ex.Message}. Value: {value}");
+                        FileLogger._isInitializedAndLoggingToFile = false; // Stop further file logging attempts
+                    }
+                }
+
+                if (ShouldWriteToConsole() && _consoleStream != null)
+                {
+                    try
+                    {
+                        if (isNewLine) _consoleStream.WriteLine(value);
+                        else _consoleStream.Write(value);
+                    }
+                    catch (Exception ex)
+                    {
+                        FileLogger._originalConsoleError?.WriteLine($"DualWriter Error (to console): {ex.Message}");
+                    }
+                }
+            }
+
+            public override void Flush()
+            {
+                if (FileLogger._logStreamWriter != null && FileLogger._isInitializedAndLoggingToFile) try { FileLogger._logStreamWriter.Flush(); } catch { /* ignore */ }
+                if (_consoleStream != null) try { _consoleStream.Flush(); } catch { /* ignore */ }
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                // This DualWriter does not own the _logStreamWriter.
+                // FileLogger.Dispose() is responsible for the _logStreamWriter.
+                // We only need to handle the base TextWriter disposal.
+                base.Dispose(disposing);
+            }
+        }
+
+        public static void Initialize(string logDirectory, ConsoleLogLevel consoleLevel, string logFileNameFormat = "app_run_{0:yyyy-MM-dd}.log")
+        {
+            _originalConsoleOut = Console.Out;
+            _originalConsoleError = Console.Error;
+
+            if (_isInitializedAndLoggingToFile) return;
+
+            _logDirectory = logDirectory;
+            _logFileNameFormat = logFileNameFormat;
+            _consoleLogLevel = consoleLevel;
+            string logFilePath = "";
+
+            try
+            {
+                if (string.IsNullOrWhiteSpace(_logDirectory))
+                {
+                    _logDirectory = Path.Combine(AppContext.BaseDirectory, "logs_default");
+                    _originalConsoleError.WriteLine($"FileLogger Init Warning: Log directory was null/empty, using default: {_logDirectory}");
+                }
+                else if (!Path.IsPathRooted(_logDirectory))
+                {
+                    _logDirectory = Path.Combine(AppContext.BaseDirectory, _logDirectory);
+                }
+
+                _originalConsoleOut.WriteLine($"FileLogger: Initializing. Target log directory: {_logDirectory}");
+
+                if (!Directory.Exists(_logDirectory))
+                {
+                    _originalConsoleOut.WriteLine($"FileLogger: Creating log directory: {_logDirectory}");
+                    Directory.CreateDirectory(_logDirectory);
+                }
+
+                logFilePath = Path.Combine(_logDirectory, string.Format(_logFileNameFormat, DateTime.UtcNow));
+                _originalConsoleOut.WriteLine($"FileLogger: Attempting to create/append log file: {logFilePath}");
+
+                var fileStream = new FileStream(logFilePath, FileMode.Append, FileAccess.Write, FileShare.Read);
+                _logStreamWriter = new StreamWriter(fileStream) { AutoFlush = true };
+
+                TextWriter? actualConsoleOut = null;
+                TextWriter? actualConsoleError = null;
+
+                switch (_consoleLogLevel)
+                {
+                    case ConsoleLogLevel.Detailed: actualConsoleOut = _originalConsoleOut; actualConsoleError = _originalConsoleError; break;
+                    case ConsoleLogLevel.Summary: actualConsoleOut = null; actualConsoleError = _originalConsoleError; break; // Only errors to console
+                    case ConsoleLogLevel.ErrorsOnly: actualConsoleOut = null; actualConsoleError = _originalConsoleError; break;
+                    case ConsoleLogLevel.Quiet: actualConsoleOut = null; actualConsoleError = null; break;
+                }
+
+                Console.SetOut(new DualWriter(_logStreamWriter, actualConsoleOut, false));
+                Console.SetError(new DualWriter(_logStreamWriter, actualConsoleError, true));
+
+                _isInitializedAndLoggingToFile = true;
+                Console.WriteLine($"FileLogger Initialized. ConsoleOutputLevel: {_consoleLogLevel}. Logging to: {logFilePath}");
+            }
+            catch (Exception ex)
+            {
+                _isInitializedAndLoggingToFile = false;
+
+                if (Console.Out is DualWriter && _originalConsoleOut != null) Console.SetOut(_originalConsoleOut);
+                if (Console.Error is DualWriter && _originalConsoleError != null) Console.SetError(_originalConsoleError);
+
+                System.Console.Error.WriteLine($"CRITICAL FileLogger Error: Failed to initialize file logging. All logs will go to console only. Exception: {ex.ToString()}");
+                System.Console.Error.WriteLine($"Attempted log directory: {_logDirectory}, Attempted log file: {logFilePath}");
+
+                _logStreamWriter?.Dispose();
+                _logStreamWriter = null;
+            }
+        }
+
+        public static void CleanupOldLogFiles(int retentionDays)
+        {
+            if (!_isInitializedAndLoggingToFile || string.IsNullOrWhiteSpace(_logDirectory) || retentionDays <= 0)
+            {
+                if (!_isInitializedAndLoggingToFile && _originalConsoleError != null) _originalConsoleError.WriteLine("FileLogger: CleanupOldLogFiles called but logger not successfully initialized for file output.");
+                else if (!_isInitializedAndLoggingToFile) System.Console.Error.WriteLine("FileLogger: CleanupOldLogFiles called but logger not successfully initialized for file output (original error stream unavailable).");
+                return;
+            }
+
+            Console.WriteLine($"FileLogger: Checking for log files older than {retentionDays} days in '{_logDirectory}'...");
+            // ... (cleanup logic remains the same) ...
+            try
+            {
+                if (!Directory.Exists(_logDirectory))
+                {
+                    Console.WriteLine($"FileLogger: Log directory '{_logDirectory}' does not exist. Nothing to clean up.");
+                    return;
+                }
+
+                var files = Directory.GetFiles(_logDirectory, "*.log");
+                string prefix = _logFileNameFormat.Substring(0, _logFileNameFormat.IndexOf('{')).TrimEnd('_');
+                string suffix = _logFileNameFormat.Substring(_logFileNameFormat.IndexOf('}') + 1);
+
+                foreach (var file in files)
+                {
+                    try
+                    {
+                        var fileNameOnly = Path.GetFileName(file);
+                        if (fileNameOnly.StartsWith(prefix) && fileNameOnly.EndsWith(suffix))
+                        {
+                            string dateString = fileNameOnly.Substring(prefix.Length, fileNameOnly.Length - prefix.Length - suffix.Length);
+                            if (dateString.Contains("_")) dateString = dateString.Substring(0, dateString.IndexOf('_'));
+
+                            if (DateTime.TryParseExact(dateString, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime fileDate))
+                            {
+                                if (fileDate.ToUniversalTime().Date < DateTime.UtcNow.AddDays(-retentionDays).Date)
+                                {
+                                    Console.WriteLine($"FileLogger: Deleting old log file: {fileNameOnly}");
+                                    File.Delete(file);
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception exInner) { Console.Error.WriteLine($"FileLogger: Error processing file {file} for cleanup. {exInner.Message}"); }
+                }
+                Console.WriteLine("FileLogger: Old log files cleanup complete.");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"FileLogger Error: Failed to cleanup old log files. {ex.Message}"); }
+        }
+
+        public static void Dispose()
+        {
+            // Log shutdown message *before* restoring original writers, so it goes to file (if still possible)
+            if (_isInitializedAndLoggingToFile && _logStreamWriter != null)
+            {
+                try
+                {
+                    Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss UTC}] FileLogger Shutting Down. Restoring original console writers.");
+                    _logStreamWriter.Flush(); // Ensure final messages are written
+                }
+                catch (ObjectDisposedException) { /* _logStreamWriter already disposed, can't log shutdown message to file */ }
+                catch (Exception ex) { (_originalConsoleError ?? System.Console.Error).WriteLine($"FileLogger: Error during final flush before dispose: {ex.Message}"); }
+            }
+
+            // Restore original console writers first, regardless of logger state
+            if (_originalConsoleOut != null && (Console.Out is DualWriter || Console.Out != _originalConsoleOut))
+            {
+                Console.SetOut(_originalConsoleOut);
+            }
+            if (_originalConsoleError != null && (Console.Error is DualWriter || Console.Error != _originalConsoleError))
+            {
+                Console.SetError(_originalConsoleError);
+            }
+
+            // Now, safely dispose the log writer
+            if (_logStreamWriter != null)
+            {
+                try
+                {
+                    _logStreamWriter.Close(); // Close also calls Dispose on the underlying stream
+                }
+                catch (Exception ex)
+                {
+                    // Use System.Console here as our redirection is reverted
+                    System.Console.Error.WriteLine($"FileLogger Error during _logStreamWriter.Close(): {ex.Message}");
+                }
+                finally
+                {
+                    _logStreamWriter = null;
+                }
+            }
+            _isInitializedAndLoggingToFile = false; // Mark as fully disposed
+        }
+    }
+}
+// AppSettings.cs (Optional: if you want to group them - in RedditVideoMaker.Core project)
+namespace RedditVideoMaker.Core
+{
+    // This class can act as a container for all your option classes.
+    public class AppSettings
+    {
+        // Ensure these properties are initialized if you bind directly to AppSettings
+        public RedditOptions RedditOptions { get; set; } = new RedditOptions();
+        public VideoOptions VideoOptions { get; set; } = new VideoOptions();
+        // You can add more options classes here as your project grows.
+    }
+}
+// GeneralOptions.cs (in RedditVideoMaker.Core project)
+using System.Collections.Generic;
+
+namespace RedditVideoMaker.Core
+{
+    public enum ConsoleLogLevel
+    {
+        Detailed, // All Console.Write/WriteLine and Console.Error goes to console
+        Summary,  // Key summary messages and all errors go to console
+        ErrorsOnly, // Only Console.Error goes to console
+        Quiet     // Nothing goes to console (everything still logged to file)
+    }
+
+    public class GeneralOptions
+    {
+        public const string SectionName = "GeneralOptions";
+
+        public bool IsInTestingModule { get; set; } = false;
+
+        public string LogFileDirectory { get; set; } = "logs";
+        public int LogFileRetentionDays { get; set; } = 7;
+
+        // New property for Step 27.2: Console Verbosity
+        /// <summary>
+        /// Controls the verbosity of output to the actual console window.
+        /// All output is still written to the log file.
+        /// Options: Detailed, Summary, ErrorsOnly, Quiet.
+        /// </summary>
+        public ConsoleLogLevel ConsoleOutputLevel { get; set; } = ConsoleLogLevel.Detailed; // Default to detailed
+    }
+}
+// ImageService.cs (in RedditVideoMaker.Core project)
+using System;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Options;
+using SixLabors.Fonts;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Drawing.Processing;
+using SixLabors.ImageSharp.Formats.Png;
+using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
+using System.Globalization;
+
+namespace RedditVideoMaker.Core
+{
+    public class ImageService
+    {
+        private readonly VideoOptions _videoOptions;
+        private readonly FontCollection _fontCollection;
+
+        public FontFamily? LoadedFontFamily { get; private set; }
+
+        public ImageService(IOptions<VideoOptions> videoOptions)
+        {
+            _videoOptions = videoOptions.Value;
+            _fontCollection = new FontCollection();
+            LoadConfiguredFont();
+        }
+
+        private void LoadConfiguredFont()
+        {
+            // Attempt 1: Load primary font from configured file path
+            if (!string.IsNullOrWhiteSpace(_videoOptions.PrimaryFontFilePath))
+            {
+                string fontFilePath = Path.Combine(AppContext.BaseDirectory, _videoOptions.PrimaryFontFilePath);
+                if (File.Exists(fontFilePath))
+                {
+                    try
+                    {
+                        var tempCollection = new FontCollection();
+                        FontFamily loadedFromFile = tempCollection.Add(fontFilePath);
+                        if (!string.IsNullOrEmpty(loadedFromFile.Name)) // Ensure it's a valid font family
+                        {
+                            LoadedFontFamily = loadedFromFile;
+                            _fontCollection.Add(fontFilePath); // Add to the service's main collection
+                            Console.WriteLine($"ImageService: Successfully loaded primary font '{LoadedFontFamily.Value.Name}' from '{fontFilePath}'.");
+                            return;
+                        }
+                        else
+                        {
+                            Console.Error.WriteLine($"ImageService Warning: Loaded font from '{fontFilePath}' but it has no name (invalid font family).");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"ImageService Warning: Failed to load primary font from '{fontFilePath}'. {ex.Message}");
+                    }
+                }
+                else
+                {
+                    Console.Error.WriteLine($"ImageService Warning: Primary font file not found at '{fontFilePath}'. Path configured: '{_videoOptions.PrimaryFontFilePath}'");
+                }
+            }
+            else
+            {
+                Console.WriteLine("ImageService: No PrimaryFontFilePath configured. Attempting fallbacks.");
+            }
+
+            // Attempt 2: Load fallback font name from system fonts
+            if (!string.IsNullOrWhiteSpace(_videoOptions.FallbackFontName))
+            {
+                if (SystemFonts.TryGet(_videoOptions.FallbackFontName, out FontFamily fallbackFontFamily) && !string.IsNullOrEmpty(fallbackFontFamily.Name))
+                {
+                    LoadedFontFamily = fallbackFontFamily;
+                    Console.WriteLine($"ImageService: Using configured fallback system font '{LoadedFontFamily.Value.Name}'.");
+                    return;
+                }
+                else
+                {
+                    Console.Error.WriteLine($"ImageService Warning: Configured fallback font '{_videoOptions.FallbackFontName}' not found on system or is invalid.");
+                }
+            }
+
+            // Attempt 3: Default to first available system font
+            if (SystemFonts.Families.Any())
+            {
+                FontFamily firstSystemFont = SystemFonts.Families.First();
+                if (!string.IsNullOrEmpty(firstSystemFont.Name))
+                {
+                    LoadedFontFamily = firstSystemFont;
+                    Console.WriteLine($"ImageService: Using first available system font '{LoadedFontFamily.Value.Name}' as a last resort.");
+                    return;
+                }
+            }
+
+            Console.Error.WriteLine("ImageService CRITICAL: No fonts could be loaded (primary, fallback, or system default). Text rendering will likely fail.");
+            LoadedFontFamily = null;
+        }
+
+        public async Task<bool> CreateRedditContentCardAsync(
+            string mainText,
+            string? author,
+            int? score,
+            string outputImagePath,
+            int cardWidth,
+            int cardHeight,
+            string backgroundColorString, // Changed from backgroundColorHex
+            string fontColorString,       // Changed from fontColorHex
+            string metadataFontColorString) // Changed from metadataFontColorHex
+        {
+            if (LoadedFontFamily == null || !LoadedFontFamily.HasValue) // Check HasValue for nullable struct
+            {
+                Console.Error.WriteLine("ImageService Error: Cannot create card because no valid font is loaded.");
+                return false;
+            }
+            FontFamily fontFamily = LoadedFontFamily.Value;
+
+            try
+            {
+                string? directory = Path.GetDirectoryName(outputImagePath);
+                if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                // Use Color.TryParse for flexibility with named colors and hex codes
+                if (!Color.TryParse(backgroundColorString, out Color bgColor))
+                {
+                    Console.Error.WriteLine($"ImageService Warning: Could not parse CardBackgroundColor '{backgroundColorString}'. Defaulting to DarkSlateGray.");
+                    bgColor = Color.DarkSlateGray;
+                }
+                if (!Color.TryParse(fontColorString, out Color textColor))
+                {
+                    Console.Error.WriteLine($"ImageService Warning: Could not parse CardFontColor '{fontColorString}'. Defaulting to White.");
+                    textColor = Color.White;
+                }
+                if (!Color.TryParse(metadataFontColorString, out Color metaColor))
+                {
+                    Console.Error.WriteLine($"ImageService Warning: Could not parse CardMetadataFontColor '{metadataFontColorString}'. Defaulting to LightGray.");
+                    metaColor = Color.LightGray;
+                }
+
+                float padding = Math.Max(15f, Math.Min(cardWidth * 0.05f, cardHeight * 0.05f));
+                float contentWidth = cardWidth - (2 * padding);
+                float currentY = padding;
+
+                using (var image = new Image<Rgba32>(cardWidth, cardHeight))
+                {
+                    image.Mutate(ctx => ctx.BackgroundColor(bgColor));
+
+                    if (!string.IsNullOrWhiteSpace(author))
+                    {
+                        Font metadataFont = fontFamily.CreateFont(_videoOptions.MetadataTargetFontSize, FontStyle.Regular);
+                        string metadataText = $"u/{author}";
+                        if (score.HasValue)
+                        {
+                            metadataText += $" • {score.Value} points";
+                        }
+
+                        var metadataTextOptions = new RichTextOptions(metadataFont)
+                        {
+                            Origin = new PointF(padding, currentY),
+                            WrappingLength = contentWidth,
+                            HorizontalAlignment = HorizontalAlignment.Left
+                        };
+                        image.Mutate(ctx => ctx.DrawText(metadataTextOptions, metadataText, metaColor));
+                        FontRectangle metadataBounds = TextMeasurer.MeasureBounds(metadataText, metadataTextOptions);
+                        currentY += metadataBounds.Height + (padding / 2);
+                    }
+
+                    Font mainFont = GetAdjustedFont(
+                        fontFamily, mainText,
+                        _videoOptions.ContentTargetFontSize, _videoOptions.ContentMinFontSize, _videoOptions.ContentMaxFontSize,
+                        contentWidth, cardHeight - currentY - padding
+                    );
+
+                    Console.WriteLine($"ImageService: Drawing text card ({cardWidth}x{cardHeight}), Main Font: {fontFamily.Name}, Size: {mainFont.Size}pt (Target: {_videoOptions.ContentTargetFontSize}pt)");
+
+                    var mainTextOptions = new RichTextOptions(mainFont)
+                    {
+                        Origin = new PointF(padding, currentY),
+                        WrappingLength = contentWidth,
+                        LineSpacing = 1.2f,
+                        HorizontalAlignment = HorizontalAlignment.Left,
+                        VerticalAlignment = VerticalAlignment.Top
+                    };
+                    image.Mutate(ctx => ctx.DrawText(mainTextOptions, mainText, textColor));
+
+                    await image.SaveAsync(outputImagePath, new PngEncoder());
+                    Console.WriteLine($"ImageService: Text card saved to {outputImagePath}");
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"ImageService Error: Failed to create text card. {ex.Message}");
+                Console.Error.WriteLine(ex.StackTrace); // Keep stack trace for detailed debugging
+                return false;
+            }
+        }
+
+        private Font GetAdjustedFont(FontFamily fontFamily, string text, float targetSize, float minSize, float maxSize, float maxWidth, float maxHeight)
+        {
+            float initialSize = Math.Clamp(targetSize, minSize, maxSize);
+            Font font = fontFamily.CreateFont(initialSize, FontStyle.Regular);
+            var textOptions = new RichTextOptions(font) { WrappingLength = maxWidth, Dpi = 72f, LineSpacing = 1.2f };
+            FontRectangle size = TextMeasurer.MeasureBounds(text, textOptions);
+
+            while ((size.Height > maxHeight || size.Width > maxWidth) && font.Size > minSize)
+            {
+                font = fontFamily.CreateFont(Math.Max(minSize, font.Size - 1), FontStyle.Regular);
+                textOptions.Font = font;
+                size = TextMeasurer.MeasureBounds(text, textOptions);
+            }
+
+            while (size.Height <= maxHeight && size.Width <= maxWidth && font.Size < maxSize && font.Size < targetSize)
+            {
+                float nextPotentialSize = Math.Min(maxSize, font.Size + 1);
+                if (nextPotentialSize <= font.Size) break;
+
+                Font nextFont = fontFamily.CreateFont(nextPotentialSize, FontStyle.Regular);
+                var nextTextOptions = new RichTextOptions(nextFont) { WrappingLength = maxWidth, Dpi = 72f, LineSpacing = 1.2f };
+                FontRectangle nextSize = TextMeasurer.MeasureBounds(text, nextTextOptions);
+
+                if (nextSize.Height > maxHeight || nextSize.Width > maxWidth) break;
+
+                font = nextFont;
+                size = nextSize;
+                if (font.Size >= targetSize) break;
+            }
+
+            if (size.Height > maxHeight && font.Size == minSize)
+            {
+                Console.WriteLine($"ImageService Warning: Text '{text.Substring(0, Math.Min(30, text.Length))}...' might be truncated vertically even at min font size {minSize}pt. MeasuredHeight: {size.Height}, MaxHeight: {maxHeight}");
+            }
+            return font;
+        }
+    }
+}
+// RedditModels.cs (in RedditVideoMaker.Core project)
+using System.Text.Json.Serialization;
+using System.Collections.Generic;
+
+namespace RedditVideoMaker.Core
+{
+    // Represents the overall structure of a Reddit API listing response
+    // This is used for lists of posts AND lists of comments
+    public class RedditListingResponse
+    {
+        [JsonPropertyName("kind")]
+        public string? Kind { get; set; }
+
+        [JsonPropertyName("data")]
+        public RedditListingData? Data { get; set; }
+    }
+
+    // Represents the 'data' part of the main listing
+    public class RedditListingData
+    {
+        [JsonPropertyName("children")]
+        public List<RedditChild>? Children { get; set; } // Can contain RedditPostData or RedditCommentData
+
+        [JsonPropertyName("after")]
+        public string? After { get; set; }
+
+        [JsonPropertyName("before")]
+        public string? Before { get; set; }
+    }
+
+    // Represents a 'child' item in the listing
+    // The 'Data' property will be dynamically typed or needs specific handling
+    // For simplicity here, we'll rely on the 'kind' property to differentiate
+    // if needed, or assume context (e.g. comments endpoint returns comment data)
+    public class RedditChild
+    {
+        [JsonPropertyName("kind")]
+        public string? Kind { get; set; } // e.g., "t3" for a link post, "t1" for a comment
+
+        // For GetFromJsonAsync to work directly with different types in Data,
+        // you might need a more complex deserialization strategy or separate models
+        // for post children vs comment children if their 'data' structure significantly differs
+        // beyond what can be captured in a union-like way.
+        // Here, we'll assume 'Data' can be deserialized into RedditPostData or RedditCommentData
+        // based on the endpoint context.
+        [JsonPropertyName("data")]
+        public object? Data { get; set; } // Will be deserialized to RedditPostData or RedditCommentData
+                                          // We will cast this later based on the 'kind' or context.
+                                          // A more robust solution might use a custom JsonConverter.
+    }
+
+    // Represents the actual data of a Reddit post
+    public class RedditPostData
+    {
+        [JsonPropertyName("title")]
+        public string? Title { get; set; }
+
+        [JsonPropertyName("author")]
+        public string? Author { get; set; }
+
+        [JsonPropertyName("name")]
+        public string? Name { get; set; }
+
+        [JsonPropertyName("id")]
+        public string? Id { get; set; }
+
+        [JsonPropertyName("subreddit")]
+        public string? Subreddit { get; set; }
+
+        [JsonPropertyName("score")]
+        public int Score { get; set; }
+
+        [JsonPropertyName("permalink")]
+        public string? Permalink { get; set; }
+
+        [JsonPropertyName("url")]
+        public string? Url { get; set; }
+
+        [JsonPropertyName("selftext")]
+        public string? Selftext { get; set; }
+
+        [JsonPropertyName("is_video")]
+        public bool IsVideo { get; set; }
+
+        [JsonPropertyName("num_comments")]
+        public int NumberOfComments { get; set; }
+
+        [JsonPropertyName("created_utc")]
+        public double CreatedUtc { get; set; }
+    }
+
+    // Represents the data of a Reddit comment
+    public class RedditCommentData
+    {
+        [JsonPropertyName("id")]
+        public string? Id { get; set; }
+
+        [JsonPropertyName("name")] // Fullname, e.g., t1_abcdef
+        public string? Name { get; set; }
+
+        [JsonPropertyName("author")]
+        public string? Author { get; set; }
+
+        [JsonPropertyName("body")] // The actual comment text
+        public string? Body { get; set; }
+
+        [JsonPropertyName("score")]
+        public int Score { get; set; }
+
+        [JsonPropertyName("created_utc")]
+        public double CreatedUtc { get; set; }
+
+        [JsonPropertyName("permalink")] // Relative URL to this specific comment
+        public string? Permalink { get; set; }
+
+        [JsonPropertyName("depth")] // Depth of the comment in a thread
+        public int Depth { get; set; }
+
+        // Replies to this comment. This can be complex.
+        // It can be an empty string if no replies, or another RedditListingResponse.
+        // For simplicity, we'll treat it as an object and handle it later if needed.
+        // A value of "" (empty string) means no replies.
+        // If it's a listing, it means there are replies.
+        // Sometimes it's an object with a "kind": "more" for "load more comments" links.
+        [JsonPropertyName("replies")]
+        public object? Replies { get; set; } // Can be string (empty or "more") or RedditListingResponse
+
+        public bool IsStickied { get; set; } // [JsonPropertyName("stickied")]
+    }
+}
+public class RedditOptions
+{
+    public const string SectionName = "RedditOptions";
+    public string Subreddit { get; set; } = "AskReddit";
+    public string PostId { get; set; } = "top";
+    public bool AllowNsfw { get; set; } = false;
+    public string? PostUrl { get; set; }
+    public int MinPostUpvotes { get; set; } = 0;
+    public int MinPostCommentsCount { get; set; } = 0;
+    public string? PostFilterStartDate { get; set; }
+    public string? PostFilterEndDate { get; set; }
+    public int MinCommentScore { get; set; } = int.MinValue;
+    public int SubredditPostsToScan { get; set; } = 50;
+    public bool BypassPostFilters { get; set; } = false;
+    public bool BypassCommentScoreFilter { get; set; } = false;
+    public string CommentSortOrder { get; set; } = "top";
+    public List<string> CommentIncludeKeywords { get; set; } = new List<string>();
+    public int NumberOfVideosInBatch { get; set; } = 1;
+}
+// RedditService.cs (in RedditVideoMaker.Core project)
+using System;
+using System.Collections.Generic;
+using System.Globalization; // For DateTime parsing
+using System.Linq; // For LINQ methods like OrderByDescending, FirstOrDefault
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text.Json; // Required for JsonElement and JsonSerializerOptions
+using System.Text.RegularExpressions; // For Regex to parse PostUrl
+using System.Threading.Tasks;
+using Microsoft.Extensions.Options; // Required for IOptions
+
+namespace RedditVideoMaker.Core
+{
+    public class RedditService
+    {
+        private static readonly HttpClient _client = new HttpClient();
+        private readonly RedditOptions _redditOptions;
+        private readonly JsonSerializerOptions _jsonOptions;
+
+        public RedditService(IOptions<RedditOptions> redditOptions)
+        {
+            _redditOptions = redditOptions.Value;
+            _jsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+
+            if (_client.DefaultRequestHeaders.UserAgent.Count == 0)
+            {
+                _client.DefaultRequestHeaders.UserAgent.ParseAdd($"CsharpRedditBot/0.6 by YourRedditUsername (config: {_redditOptions.Subreddit})");
+                _client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            }
+        }
+
+        private async Task<RedditPostData?> FetchSinglePostDataAsync(string subreddit, string postId)
+        {
+            string url = $"https://www.reddit.com/r/{subreddit}/comments/{postId}.json";
+            Console.WriteLine($"RedditService: Fetching single post from URL: {url}");
+            try
+            {
+                // Using GetAsync and then ReadFromJsonAsync for more control over error response
+                HttpResponseMessage response = await _client.GetAsync(url);
+                if (!response.IsSuccessStatusCode)
+                {
+                    Console.Error.WriteLine($"RedditService: HTTP Error fetching post {url}. Status: {response.StatusCode}. Reason: {response.ReasonPhrase}");
+                    // Optionally, read and log response content for debugging if needed, e.g., await response.Content.ReadAsStringAsync();
+                    return null;
+                }
+
+                // The response for comments endpoint is an array of two listings.
+                var responseListings = await response.Content.ReadFromJsonAsync<List<RedditListingResponse>>(_jsonOptions);
+
+                if (responseListings != null && responseListings.Any())
+                {
+                    var postListing = responseListings[0];
+                    if (postListing?.Data?.Children != null && postListing.Data.Children.Any())
+                    {
+                        var postChild = postListing.Data.Children[0];
+                        if (postChild.Data is JsonElement element && postChild.Kind == "t3")
+                        {
+                            return element.Deserialize<RedditPostData>(_jsonOptions);
+                        }
+                    }
+                }
+                Console.Error.WriteLine($"RedditService: Could not parse post data for {subreddit}/comments/{postId} from URL: {url}");
+                return null;
+            }
+            catch (HttpRequestException httpEx)
+            {
+                Console.Error.WriteLine($"RedditService: HttpRequestException fetching single post {url}: {httpEx.Message} (StatusCode: {httpEx.StatusCode})");
+                return null;
+            }
+            catch (JsonException jsonEx)
+            {
+                Console.Error.WriteLine($"RedditService: JsonException parsing single post {url}: {jsonEx.Message} (Path: {jsonEx.Path}, Line: {jsonEx.LineNumber}, Pos: {jsonEx.BytePositionInLine})");
+                return null;
+            }
+            catch (NotSupportedException nsEx) // Can be thrown by ReadFromJsonAsync if content type is not JSON
+            {
+                Console.Error.WriteLine($"RedditService: NotSupportedException (likely invalid content type) parsing single post {url}: {nsEx.Message}");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"RedditService: General Error fetching single post {url}: {ex.ToString()}"); // Log full exception details
+                return null;
+            }
+        }
+
+        private (string? Subreddit, string? PostId) ParseRedditPostUrl(string postUrl)
+        {
+            var regex = new Regex(@"reddit\.com/r/(?<subreddit>[^/]+)/comments/(?<postid>[^/]+)/?", RegexOptions.IgnoreCase);
+            var match = regex.Match(postUrl);
+
+            if (match.Success)
+            {
+                return (match.Groups["subreddit"].Value, match.Groups["postid"].Value);
+            }
+            Console.Error.WriteLine($"RedditService: Could not parse subreddit and post ID from URL: {postUrl}");
+            return (null, null);
+        }
+
+        public async Task<List<RedditPostData>> GetTopPostsAsync()
+        {
+            var selectedPostsResult = new List<RedditPostData>();
+
+            if (!string.IsNullOrWhiteSpace(_redditOptions.PostUrl))
+            {
+                Console.WriteLine($"RedditService: Attempting to fetch specific post from URL: {_redditOptions.PostUrl}");
+                var (subreddit, postId) = ParseRedditPostUrl(_redditOptions.PostUrl);
+                if (!string.IsNullOrWhiteSpace(subreddit) && !string.IsNullOrWhiteSpace(postId))
+                {
+                    RedditPostData? specificPost = await FetchSinglePostDataAsync(subreddit, postId);
+                    if (specificPost != null)
+                    {
+                        bool meetsCriteria = true;
+                        if (!_redditOptions.BypassPostFilters)
+                        {
+                            if (_redditOptions.MinPostCommentsCount > 0 && specificPost.NumberOfComments < _redditOptions.MinPostCommentsCount)
+                            {
+                                Console.WriteLine($"RedditService: Post from URL {specificPost.Id} has {specificPost.NumberOfComments} comments, less than MinPostCommentsCount of {_redditOptions.MinPostCommentsCount}.");
+                                meetsCriteria = false;
+                            }
+                            if (meetsCriteria && _redditOptions.MinPostUpvotes > 0 && specificPost.Score < _redditOptions.MinPostUpvotes)
+                            {
+                                Console.WriteLine($"RedditService: Post from URL {specificPost.Id} has {specificPost.Score} upvotes, less than MinPostUpvotes of {_redditOptions.MinPostUpvotes}.");
+                                meetsCriteria = false;
+                            }
+                        }
+
+                        if (meetsCriteria)
+                        {
+                            selectedPostsResult.Add(specificPost);
+                        }
+                        else
+                        {
+                            Console.WriteLine($"RedditService: Specified post from URL does not meet all configured criteria and filters are not bypassed. Not processing.");
+                        }
+                    }
+                    // FetchSinglePostDataAsync already logs its errors
+                }
+                // ParseRedditPostUrl already logs its errors
+            }
+            else
+            {
+                Console.WriteLine($"RedditService: Scanning /r/{_redditOptions.Subreddit} for posts. Sort: '{_redditOptions.PostId}', Scan Limit: {_redditOptions.SubredditPostsToScan}");
+                string url = $"https://www.reddit.com/r/{_redditOptions.Subreddit}/{_redditOptions.PostId}/.json?limit={_redditOptions.SubredditPostsToScan}";
+                try
+                {
+                    HttpResponseMessage response = await _client.GetAsync(url);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        Console.Error.WriteLine($"RedditService: HTTP Error fetching posts from {url}. Status: {response.StatusCode}. Reason: {response.ReasonPhrase}");
+                        return selectedPostsResult; // Return empty list
+                    }
+
+                    RedditListingResponse? listingResponse = await response.Content.ReadFromJsonAsync<RedditListingResponse>(_jsonOptions);
+
+                    if (listingResponse?.Data?.Children != null)
+                    {
+                        var candidates = new List<RedditPostData>();
+                        foreach (var child in listingResponse.Data.Children)
+                        {
+                            if (child.Data is JsonElement element && child.Kind == "t3")
+                            {
+                                RedditPostData? postData = element.Deserialize<RedditPostData>(_jsonOptions);
+                                if (postData != null)
+                                {
+                                    if (_redditOptions.BypassPostFilters)
+                                    {
+                                        candidates.Add(postData);
+                                        continue;
+                                    }
+
+                                    bool dateFilterPassed = true;
+                                    if (!string.IsNullOrWhiteSpace(_redditOptions.PostFilterStartDate) &&
+                                        DateTime.TryParseExact(_redditOptions.PostFilterStartDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime startDate))
+                                    {
+                                        if (DateTimeOffset.FromUnixTimeSeconds((long)postData.CreatedUtc).UtcDateTime < startDate)
+                                        { dateFilterPassed = false; }
+                                    }
+                                    if (dateFilterPassed && !string.IsNullOrWhiteSpace(_redditOptions.PostFilterEndDate) &&
+                                        DateTime.TryParseExact(_redditOptions.PostFilterEndDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime endDate))
+                                    {
+                                        if (DateTimeOffset.FromUnixTimeSeconds((long)postData.CreatedUtc).UtcDateTime >= endDate.AddDays(1))
+                                        { dateFilterPassed = false; }
+                                    }
+
+                                    bool commentsCountPassed = _redditOptions.MinPostCommentsCount <= 0 || postData.NumberOfComments >= _redditOptions.MinPostCommentsCount;
+                                    bool upvotesPassed = _redditOptions.MinPostUpvotes <= 0 || postData.Score >= _redditOptions.MinPostUpvotes;
+                                    bool isSelfPostOrDirectImage = !postData.IsVideo && (postData.Url.Contains($"/r/{postData.Subreddit}/comments/") || Regex.IsMatch(postData.Url, @"\.(jpeg|jpg|gif|png)$", RegexOptions.IgnoreCase));
+
+                                    if (dateFilterPassed && commentsCountPassed && upvotesPassed && isSelfPostOrDirectImage)
+                                    {
+                                        candidates.Add(postData);
+                                    }
+                                }
+                            }
+                        }
+                        Console.WriteLine($"RedditService: Found {candidates.Count} candidate posts after all filters (BypassPostFilters: {_redditOptions.BypassPostFilters}).");
+                        if (candidates.Any())
+                        {
+                            selectedPostsResult.AddRange(candidates
+                                .OrderByDescending(p => p.Score)
+                                .Take(_redditOptions.NumberOfVideosInBatch)
+                                .ToList());
+                            Console.WriteLine($"RedditService: Selected {selectedPostsResult.Count} posts for batch processing.");
+                        }
+                    }
+                }
+                catch (HttpRequestException httpEx) { Console.Error.WriteLine($"RedditService: HttpRequestException fetching posts from {url}: {httpEx.Message} (StatusCode: {httpEx.StatusCode})"); }
+                catch (JsonException jsonEx) { Console.Error.WriteLine($"RedditService: JsonException parsing posts from {url}: {jsonEx.Message}"); }
+                catch (NotSupportedException nsEx) { Console.Error.WriteLine($"RedditService: NotSupportedException (likely invalid content type) parsing posts from {url}: {nsEx.Message}"); }
+                catch (Exception ex) { Console.Error.WriteLine($"RedditService: General Error fetching posts from {url}: {ex.ToString()}"); }
+            }
+
+            if (!selectedPostsResult.Any())
+            {
+                Console.Error.WriteLine("RedditService: No suitable post(s) found based on current criteria and filters.");
+            }
+            return selectedPostsResult;
+        }
+
+        public async Task<List<RedditCommentData>?> GetCommentsAsync(string subreddit, string postId, int commentFetchLimit = 100)
+        {
+            if (string.IsNullOrWhiteSpace(subreddit) || string.IsNullOrWhiteSpace(postId))
+            {
+                Console.Error.WriteLine("RedditService Error: Subreddit and Post ID cannot be empty for fetching comments.");
+                return null;
+            }
+            string url = $"https://www.reddit.com/r/{subreddit}/comments/{postId}.json?limit={commentFetchLimit}&depth=1&sort={_redditOptions.CommentSortOrder}";
+            Console.WriteLine($"RedditService: Fetching comments from URL: {url}");
+
+            try
+            {
+                HttpResponseMessage response = await _client.GetAsync(url);
+                if (!response.IsSuccessStatusCode)
+                {
+                    Console.Error.WriteLine($"RedditService: HTTP Error fetching comments from {url}. Status: {response.StatusCode}. Reason: {response.ReasonPhrase}");
+                    return null;
+                }
+
+                List<RedditListingResponse>? responseListings = await response.Content.ReadFromJsonAsync<List<RedditListingResponse>>(_jsonOptions);
+
+                if (responseListings != null && responseListings.Count > 1)
+                {
+                    RedditListingResponse? commentListing = responseListings[1];
+                    if (commentListing?.Data?.Children != null)
+                    {
+                        var comments = new List<RedditCommentData>();
+                        foreach (var child in commentListing.Data.Children)
+                        {
+                            if (child.Data is JsonElement element && child.Kind == "t1")
+                            {
+                                RedditCommentData? commentData = element.Deserialize<RedditCommentData>(_jsonOptions);
+                                bool includeThisComment = commentData != null &&
+                                                          !string.IsNullOrWhiteSpace(commentData.Body) &&
+                                                          commentData.Author != "[deleted]" &&
+                                                          !commentData.IsStickied;
+
+                                if (includeThisComment && !_redditOptions.BypassCommentScoreFilter)
+                                {
+                                    includeThisComment = _redditOptions.MinCommentScore == int.MinValue || commentData!.Score >= _redditOptions.MinCommentScore;
+                                }
+
+                                if (includeThisComment && _redditOptions.CommentIncludeKeywords.Any())
+                                {
+                                    includeThisComment = _redditOptions.CommentIncludeKeywords
+                                        .Any(keyword => commentData!.Body!.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+                                }
+
+                                if (includeThisComment)
+                                {
+                                    comments.Add(commentData!);
+                                }
+                            }
+                        }
+                        Console.WriteLine($"RedditService: Fetched {comments.Count} comments after all filters for post {postId}.");
+                        return comments;
+                    }
+                }
+                Console.WriteLine($"RedditService: No comments found or error in comment response structure for post {postId} from URL: {url}.");
+                return new List<RedditCommentData>();
+            }
+            catch (HttpRequestException httpEx) { Console.Error.WriteLine($"RedditService: HttpRequestException fetching comments for {url}: {httpEx.Message} (StatusCode: {httpEx.StatusCode})"); }
+            catch (JsonException jsonEx) { Console.Error.WriteLine($"RedditService: JsonException parsing comments for {url}: {jsonEx.Message}"); }
+            catch (NotSupportedException nsEx) { Console.Error.WriteLine($"RedditService: NotSupportedException (likely invalid content type) parsing comments for {url}: {nsEx.Message}"); }
+            catch (Exception ex) { Console.Error.WriteLine($"RedditService: General Error fetching comments for {url}: {ex.ToString()}"); }
+            return null;
+        }
+    }
+}
+
+// TextUtilities.cs (in RedditVideoMaker.Core project)
+using SixLabors.Fonts;
+using SixLabors.ImageSharp.Drawing.Processing;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions; // Required for Regex
+
+namespace RedditVideoMaker.Core
+{
+    public static class TextUtilities
+    {
+        /// <summary>
+        /// Cleans text for Text-to-Speech by removing/replacing certain Markdown elements
+        /// and normalizing whitespace for better pronunciation.
+        /// </summary>
+        /// <param name="inputText">The text to clean.</param>
+        /// <returns>Cleaned text suitable for TTS.</returns>
+        public static string CleanTextForTts(string inputText)
+        {
+            if (string.IsNullOrWhiteSpace(inputText))
+            {
+                return string.Empty;
+            }
+
+            string text = inputText;
+
+            // Remove or replace common Markdown:
+            // 1. Links: [link text](url) -> link text
+            text = Regex.Replace(text, @"\[([^\]]+)\]\([^\)]+\)", "$1");
+
+            // 2. Emphasis: *italic* or _italic_ -> italic, **bold** or __bold__ -> bold, ***bold italic*** -> bold italic
+            //    We'll remove the asterisks/underscores. More complex emphasis might need more rules.
+            text = Regex.Replace(text, @"(?<=[^\\])\*\*\*(.*?)\*\*\*", "$1"); // ***bold italic***
+            text = Regex.Replace(text, @"(?<=[^\\])\*\*(.*?)\*\*", "$1");   // **bold**
+            text = Regex.Replace(text, @"(?<=[^\\])\*(.*?)\*", "$1");     // *italic*
+            text = Regex.Replace(text, @"(?<=[^\\])__(.*?)__", "$1");   // __bold__ (like Markdown)
+            text = Regex.Replace(text, @"(?<=[^\\])_(.*?)_", "$1");     // _italic_ (like Markdown)
+
+            // 3. Strikethrough: ~~text~~ -> text
+            text = Regex.Replace(text, @"~~(.*?)~~", "$1");
+
+            // 4. Code blocks (inline `` and fenced ```) - remove backticks, keep content for now
+            //    For fenced code blocks, we might just take the content and replace newlines.
+            //    This is a simple removal of backticks. Multi-line code blocks are harder.
+            text = text.Replace("`", "");
+
+            // 5. Blockquotes: > text -> text (remove leading '>')
+            text = Regex.Replace(text, @"^\s*>\s*", "", RegexOptions.Multiline);
+
+            // 6. Headers: # text, ## text etc. -> text (remove leading '#')
+            text = Regex.Replace(text, @"^\s*#+\s*", "", RegexOptions.Multiline);
+
+            // 7. Horizontal rules: ---, ***, ___ -> replace with a pause (e.g., period and space)
+            text = Regex.Replace(text, @"^\s*(\*\s*){3,}\s*$", ". ", RegexOptions.Multiline);
+            text = Regex.Replace(text, @"^\s*(-\s*){3,}\s*$", ". ", RegexOptions.Multiline);
+            text = Regex.Replace(text, @"^\s*(_\s*){3,}\s*$", ". ", RegexOptions.Multiline);
+
+            // Normalize line breaks and whitespace:
+            // Replace multiple line breaks with a single period and space (for a pause)
+            // This helps TTS engines create a more natural pause than just spaces.
+            text = Regex.Replace(text, @"(\r\n|\r|\n){2,}", ". ");
+            // Replace single line breaks (that aren't already part of a sentence end) with a space
+            text = Regex.Replace(text, @"(?<!\.)(\r\n|\r|\n)(?!\s*\.)", " ");
+
+            // Replace multiple spaces with a single space
+            text = Regex.Replace(text, @"\s{2,}", " ");
+
+            // Remove leading/trailing whitespace
+            text = text.Trim();
+
+            // Optional: Add a period if the text doesn't end with punctuation, for a clean TTS stop.
+            if (!string.IsNullOrEmpty(text) && !(".?!".Contains(text.Last())))
+            {
+                text += ".";
+            }
+
+            return text;
+        }
+
+        public static List<string> SplitTextIntoPages(
+            string text,
+            Font font,
+            float maxWidth,
+            float maxHeight,
+            float lineSpacing = 1.2f)
+        {
+            var pages = new List<string>();
+            if (string.IsNullOrWhiteSpace(text) || maxWidth <= 0 || maxHeight <= 0)
+            {
+                if (!string.IsNullOrWhiteSpace(text)) pages.Add(text);
+                return pages;
+            }
+
+            var words = text.Split(new[] { ' ', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+                            .SelectMany(word => SplitWordIfTooLong(word, font, maxWidth))
+                            .ToList();
+
+            if (!words.Any())
+            {
+                pages.Add(string.Empty);
+                return pages;
+            }
+
+            var currentPageText = new StringBuilder();
+            var currentLineText = new StringBuilder();
+            float currentY = 0f;
+
+            var textOptions = new RichTextOptions(font)
+            {
+                LineSpacing = lineSpacing,
+                Dpi = 72f
+            };
+
+            FontRectangle singleLineBounds = TextMeasurer.MeasureBounds("Xg", textOptions); // Use "Xg" for better height estimate
+            float estimatedLineHeight = singleLineBounds.Height > 0 ? singleLineBounds.Height : font.Size;
+            if (estimatedLineHeight <= 0) estimatedLineHeight = font.Size > 0 ? font.Size : 12f;
+
+            foreach (var word in words)
+            {
+                string testLine = currentLineText.Length > 0 ? currentLineText.ToString() + " " + word : word;
+                FontRectangle wordBoundsOnLine = TextMeasurer.MeasureBounds(testLine, new RichTextOptions(font) { Dpi = 72f });
+
+                if (wordBoundsOnLine.Width > maxWidth && currentLineText.Length > 0)
+                {
+                    if (currentY + estimatedLineHeight > maxHeight && currentPageText.Length > 0)
+                    {
+                        pages.Add(currentPageText.ToString().TrimEnd('\n', ' '));
+                        currentPageText.Clear();
+                        currentY = 0;
+                    }
+                    currentPageText.Append(currentLineText.ToString().Trim() + "\n");
+                    currentY += estimatedLineHeight;
+                    currentLineText.Clear();
+
+                    currentLineText.Append(word);
+                }
+                else if (wordBoundsOnLine.Width > maxWidth && currentLineText.Length == 0)
+                {
+                    // This word itself is too long for a line (even after pre-splitting via SplitWordIfTooLong)
+                    // This indicates SplitWordIfTooLong might need refinement or this word is extremely long.
+                    // For now, add it and let it overflow or be handled by image rendering if possible.
+                    if (currentY + estimatedLineHeight > maxHeight && currentPageText.Length > 0)
+                    {
+                        pages.Add(currentPageText.ToString().TrimEnd('\n', ' '));
+                        currentPageText.Clear();
+                        currentY = 0;
+                    }
+                    currentPageText.Append(word + "\n");
+                    currentY += estimatedLineHeight;
+                }
+                else
+                {
+                    currentLineText.Append((currentLineText.Length > 0 ? " " : "") + word);
+                }
+            }
+
+            if (currentLineText.Length > 0)
+            {
+                if (currentY + estimatedLineHeight > maxHeight && currentPageText.Length > 0)
+                {
+                    pages.Add(currentPageText.ToString().TrimEnd('\n', ' '));
+                    currentPageText.Clear();
+                }
+                currentPageText.Append(currentLineText.ToString().Trim());
+            }
+
+            if (currentPageText.Length > 0)
+            {
+                pages.Add(currentPageText.ToString().TrimEnd('\n', ' '));
+            }
+
+            if (!pages.Any() && !string.IsNullOrWhiteSpace(text))
+            {
+                pages.Add(text);
+            }
+
+            return pages.Where(p => !string.IsNullOrWhiteSpace(p)).ToList();
+        }
+
+        private static IEnumerable<string> SplitWordIfTooLong(string word, Font font, float maxWidth)
+        {
+            var textOptions = new RichTextOptions(font) { Dpi = 72f };
+            FontRectangle wordBounds = TextMeasurer.MeasureBounds(word, textOptions);
+
+            if (wordBounds.Width <= maxWidth)
+            {
+                yield return word;
+                yield break;
+            }
+
+            var currentChunk = new StringBuilder();
+            // Try to split character by character if a single word is too long
+            for (int i = 0; i < word.Length; i++)
+            {
+                char currentChar = word[i];
+                FontRectangle currentChunkWithCharBounds = TextMeasurer.MeasureBounds(currentChunk.ToString() + currentChar, textOptions);
+
+                if (currentChunk.Length > 0 && currentChunkWithCharBounds.Width > maxWidth)
+                {
+                    yield return currentChunk.ToString(); // Return the part that fit
+                    currentChunk.Clear(); // Start a new chunk
+                }
+                currentChunk.Append(currentChar);
+            }
+            if (currentChunk.Length > 0)
+            {
+                yield return currentChunk.ToString();
+            }
+        }
+    }
+}
+// TtsOptions.cs (in RedditVideoMaker.Core project)
+using System.Collections.Generic;
+
+namespace RedditVideoMaker.Core
+{
+    public class TtsOptions
+    {
+        public const string SectionName = "TtsOptions";
+        public string Engine { get; set; } = "SystemSpeech";
+        public string? AzureSpeechKey { get; set; }
+        public string? AzureSpeechRegion { get; set; }
+        public string? AzureVoiceName { get; set; }
+        public string? GoogleCloudCredentialsPath { get; set; }
+        public string? GoogleCloudVoiceName { get; set; }
+        public string? GoogleCloudLanguageCode { get; set; } = "en-US";
+    }
+}
+// TtsService.cs (in RedditVideoMaker.Core project)
+using System;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Options;
+using Microsoft.CognitiveServices.Speech;
+using Microsoft.CognitiveServices.Speech.Audio;
+using Google.Cloud.TextToSpeech.V1;
+
+// No 'using System.Speech.Synthesis;' here at the top level to avoid ambiguity.
+
+namespace RedditVideoMaker.Core
+{
+    public class TtsService
+    {
+        private readonly TtsOptions _ttsOptions;
+        private readonly GeneralOptions _generalOptions; // For testing mode
+
+        public TtsService(IOptions<TtsOptions> ttsOptions, IOptions<GeneralOptions> generalOptions)
+        {
+            _ttsOptions = ttsOptions.Value;
+            _generalOptions = generalOptions.Value;
+        }
+
+        public async Task<bool> TextToSpeechAsync(string text, string outputFilePath)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                Console.Error.WriteLine("TTS Error: Input text cannot be empty.");
+                return false;
+            }
+            if (string.IsNullOrWhiteSpace(outputFilePath))
+            {
+                Console.Error.WriteLine("TTS Error: Output file path cannot be empty.");
+                return false;
+            }
+
+            string? directory = Path.GetDirectoryName(outputFilePath);
+            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            // Check for testing mode first
+            if (_generalOptions.IsInTestingModule)
+            {
+                Console.WriteLine("TTS: In Testing Mode - Using SystemSpeech.");
+                return await Task.Run(() => SynthesizeWithSystemSpeech(text, outputFilePath));
+            }
+
+            Console.WriteLine($"TTS: Attempting to use configured engine: '{_ttsOptions.Engine}'");
+
+            if (_ttsOptions.Engine?.Equals("Azure", StringComparison.OrdinalIgnoreCase) == true &&
+                !string.IsNullOrWhiteSpace(_ttsOptions.AzureSpeechKey) &&
+                !string.IsNullOrWhiteSpace(_ttsOptions.AzureSpeechRegion))
+            {
+                Console.WriteLine("TTS: Using Azure Cognitive Services Speech.");
+                return await SynthesizeWithAzureAsync(text, outputFilePath);
+            }
+            else if (_ttsOptions.Engine?.Equals("GoogleCloud", StringComparison.OrdinalIgnoreCase) == true &&
+                     !string.IsNullOrWhiteSpace(_ttsOptions.GoogleCloudCredentialsPath) &&
+                     File.Exists(_ttsOptions.GoogleCloudCredentialsPath))
+            {
+                Console.WriteLine("TTS: Using Google Cloud Text-to-Speech.");
+                return await SynthesizeWithGoogleCloudAsync(text, outputFilePath);
+            }
+            else
+            {
+                // Fallback logic if a specific engine was configured but credentials were bad
+                if (_ttsOptions.Engine?.Equals("Azure", StringComparison.OrdinalIgnoreCase) == true)
+                    Console.Error.WriteLine("TTS Warning: Azure engine selected, but credentials missing/invalid. Falling back to SystemSpeech.");
+                else if (_ttsOptions.Engine?.Equals("GoogleCloud", StringComparison.OrdinalIgnoreCase) == true)
+                    Console.Error.WriteLine("TTS Warning: GoogleCloud engine selected, but credentials path missing or invalid. Falling back to SystemSpeech.");
+                else if (!string.IsNullOrWhiteSpace(_ttsOptions.Engine) && !_ttsOptions.Engine.Equals("SystemSpeech", StringComparison.OrdinalIgnoreCase))
+                    Console.Error.WriteLine($"TTS Warning: Configured engine '{_ttsOptions.Engine}' is not recognized or fully configured. Falling back to SystemSpeech.");
+
+                Console.WriteLine("TTS: Using SystemSpeech (fallback).");
+                return await Task.Run(() => SynthesizeWithSystemSpeech(text, outputFilePath));
+            }
+        }
+
+        private async Task<bool> SynthesizeWithAzureAsync(string text, string outputFilePath)
+        {
+            try
+            {
+                var speechConfig = SpeechConfig.FromSubscription(_ttsOptions.AzureSpeechKey, _ttsOptions.AzureSpeechRegion);
+                if (!string.IsNullOrWhiteSpace(_ttsOptions.AzureVoiceName))
+                {
+                    speechConfig.SpeechSynthesisVoiceName = _ttsOptions.AzureVoiceName;
+                    Console.WriteLine($"TTS (Azure): Using voice: {_ttsOptions.AzureVoiceName}");
+                }
+                else
+                {
+                    Console.WriteLine("TTS (Azure): Using default voice for the region/language.");
+                }
+                // Fully qualify AudioConfig for Azure
+                using var audioConfig = Microsoft.CognitiveServices.Speech.Audio.AudioConfig.FromWavFileOutput(outputFilePath);
+                using var synthesizer = new Microsoft.CognitiveServices.Speech.SpeechSynthesizer(speechConfig, audioConfig);
+
+                Console.WriteLine($"TTS (Azure): Synthesizing: \"{text.Substring(0, Math.Min(text.Length, 70))}...\"");
+                var result = await synthesizer.SpeakTextAsync(text);
+
+                if (result.Reason == ResultReason.SynthesizingAudioCompleted)
+                {
+                    Console.WriteLine($"TTS (Azure): Speech saved to {outputFilePath}"); return true;
+                }
+                else
+                {
+                    var cancellationDetails = SpeechSynthesisCancellationDetails.FromResult(result);
+                    Console.Error.WriteLine($"TTS (Azure) Error: {result.Reason}, Details: {cancellationDetails?.ErrorDetails}");
+                    if (cancellationDetails?.Reason == CancellationReason.Error)
+                    {
+                        Console.Error.WriteLine($"TTS (Azure) ErrorCode: {cancellationDetails.ErrorCode}");
+                    }
+                    return false;
+                }
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"TTS (Azure) Error: {ex.Message}"); return false; }
+        }
+
+        private async Task<bool> SynthesizeWithGoogleCloudAsync(string text, string outputFilePath)
+        {
+            try
+            {
+                var clientBuilder = new TextToSpeechClientBuilder
+                {
+                    CredentialsPath = _ttsOptions.GoogleCloudCredentialsPath
+                };
+                TextToSpeechClient client = await clientBuilder.BuildAsync();
+
+                var input = new SynthesisInput { Text = text };
+                var voiceSelection = new VoiceSelectionParams
+                {
+                    LanguageCode = !string.IsNullOrWhiteSpace(_ttsOptions.GoogleCloudLanguageCode) ? _ttsOptions.GoogleCloudLanguageCode : "en-US"
+                };
+
+                if (!string.IsNullOrWhiteSpace(_ttsOptions.GoogleCloudVoiceName))
+                {
+                    voiceSelection.Name = _ttsOptions.GoogleCloudVoiceName;
+                    Console.WriteLine($"TTS (GoogleCloud): Using voice: {_ttsOptions.GoogleCloudVoiceName} for language: {voiceSelection.LanguageCode}");
+                }
+                else
+                {
+                    Console.WriteLine($"TTS (GoogleCloud): Using default voice for language: {voiceSelection.LanguageCode}");
+                }
+
+                // Fully qualify AudioConfig for Google Cloud
+                var audioConfig = new Google.Cloud.TextToSpeech.V1.AudioConfig { AudioEncoding = Google.Cloud.TextToSpeech.V1.AudioEncoding.Linear16 };
+
+                Console.WriteLine($"TTS (GoogleCloud): Synthesizing: \"{text.Substring(0, Math.Min(text.Length, 70))}...\"");
+                var response = await client.SynthesizeSpeechAsync(input, voiceSelection, audioConfig);
+
+                await File.WriteAllBytesAsync(outputFilePath, response.AudioContent.ToByteArray());
+
+                Console.WriteLine($"TTS (GoogleCloud): Speech saved to {outputFilePath}");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"TTS (GoogleCloud) Error: {ex.Message}");
+                Console.Error.WriteLine("Ensure your Google Cloud credentials JSON path is correct, the service account has 'Cloud Text-to-Speech API User' role, and billing is enabled on your GCP project.");
+                return false;
+            }
+        }
+
+        private bool SynthesizeWithSystemSpeech(string text, string outputFilePath)
+        {
+            try
+            {
+                // Fully qualify the System.Speech.Synthesis.SpeechSynthesizer
+                using (var synthesizer = new System.Speech.Synthesis.SpeechSynthesizer())
+                {
+                    synthesizer.SetOutputToWaveFile(outputFilePath);
+                    Console.WriteLine($"TTS (SystemSpeech): Synthesizing...");
+                    synthesizer.Speak(text);
+                    Console.WriteLine($"TTS (SystemSpeech): Speech saved to {outputFilePath}");
+                }
+                return true;
+            }
+            catch (PlatformNotSupportedException) { Console.Error.WriteLine("TTS (SystemSpeech) Error: Not supported on this platform."); return false; }
+            catch (Exception ex) { Console.Error.WriteLine($"TTS (SystemSpeech) Error: {ex.Message}"); return false; }
+        }
+    }
+}
+// UploadTrackerService.cs (in RedditVideoMaker.Core project)
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Options;
+
+namespace RedditVideoMaker.Core
+{
+    public class UploadTrackerService
+    {
+        private readonly YouTubeOptions _youTubeOptions;
+        private readonly string _logFilePath;
+        private HashSet<string> _uploadedPostIds;
+        private static readonly object _fileLock = new object(); // For thread-safe file access
+
+        public UploadTrackerService(IOptions<YouTubeOptions> youTubeOptions)
+        {
+            _youTubeOptions = youTubeOptions.Value;
+
+            if (string.IsNullOrWhiteSpace(_youTubeOptions.UploadedPostsLogPath))
+            {
+                _logFilePath = Path.Combine(AppContext.BaseDirectory, "uploaded_post_ids_default.log");
+                Console.Error.WriteLine($"UploadTrackerService Warning: UploadedPostsLogPath not configured, using default: {_logFilePath}");
+            }
+            else if (Path.IsPathRooted(_youTubeOptions.UploadedPostsLogPath))
+            {
+                _logFilePath = _youTubeOptions.UploadedPostsLogPath;
+            }
+            else
+            {
+                _logFilePath = Path.Combine(AppContext.BaseDirectory, _youTubeOptions.UploadedPostsLogPath);
+            }
+
+            _uploadedPostIds = LoadUploadedPostIds();
+            Console.WriteLine($"UploadTrackerService: Initialized. Tracking '{Path.GetFileName(_logFilePath)}' at '{_logFilePath}'. Loaded {_uploadedPostIds.Count} previously uploaded post IDs.");
+        }
+
+        private HashSet<string> LoadUploadedPostIds()
+        {
+            var ids = new HashSet<string>();
+            Console.WriteLine($"UploadTrackerService: Attempting to load uploaded post IDs from: {_logFilePath}");
+            try
+            {
+                if (!File.Exists(_logFilePath))
+                {
+                    Console.WriteLine($"UploadTrackerService: Log file '{_logFilePath}' not found. Assuming no posts previously uploaded. Will create if needed.");
+                    return ids;
+                }
+
+                // Use a lock for reading as well, in case of rare concurrent access (less likely for console app startup)
+                lock (_fileLock)
+                {
+                    var lines = File.ReadAllLines(_logFilePath);
+                    foreach (var line in lines)
+                    {
+                        if (!string.IsNullOrWhiteSpace(line))
+                        {
+                            ids.Add(line.Trim());
+                        }
+                    }
+                }
+                Console.WriteLine($"UploadTrackerService: Successfully loaded {ids.Count} IDs from '{_logFilePath}'.");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"UploadTrackerService Error: Failed to load uploaded post IDs from '{_logFilePath}'. {ex.ToString()}"); // Log full exception
+            }
+            return ids;
+        }
+
+        public bool HasPostBeenUploaded(string postId)
+        {
+            if (!_youTubeOptions.EnableDuplicateCheck)
+            {
+                return false;
+            }
+            bool wasUploaded = _uploadedPostIds.Contains(postId);
+            // This log can be very verbose if checking many posts, consider reducing if needed
+            // Console.WriteLine($"UploadTrackerService: Checking if Post ID '{postId}' was uploaded: {wasUploaded}. (Cache size: {_uploadedPostIds.Count})");
+            return wasUploaded;
+        }
+
+        public async Task AddPostIdToLogAsync(string postId)
+        {
+            Console.WriteLine($"UploadTrackerService: Received request to log Post ID '{postId}'. Duplicate check enabled: {_youTubeOptions.EnableDuplicateCheck}");
+            if (!_youTubeOptions.EnableDuplicateCheck)
+            {
+                Console.WriteLine($"UploadTrackerService: Duplicate check disabled. Not logging '{postId}'.");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(postId))
+            {
+                Console.Error.WriteLine("UploadTrackerService Error: Cannot log an empty post ID.");
+                return;
+            }
+
+            // Lock ensures thread-safe access to both the HashSet and the file.
+            bool addedToMemory;
+            lock (_fileLock) // Synchronize access to _uploadedPostIds and file operations
+            {
+                addedToMemory = _uploadedPostIds.Add(postId); // Add returns true if item was added, false if already present
+            }
+
+            if (!addedToMemory)
+            {
+                Console.WriteLine($"UploadTrackerService: Post ID '{postId}' already in in-memory set. Not writing to file again this session.");
+                return;
+            }
+
+            Console.WriteLine($"UploadTrackerService: Post ID '{postId}' added to in-memory cache. Attempting to write to file.");
+
+            try
+            {
+                string? directory = Path.GetDirectoryName(_logFilePath);
+                Console.WriteLine($"UploadTrackerService: Log file directory: '{directory}'. Log file path: '{_logFilePath}'.");
+                if (!string.IsNullOrWhiteSpace(directory) && !Directory.Exists(directory))
+                {
+                    Console.WriteLine($"UploadTrackerService: Creating directory for upload log: {directory}");
+                    Directory.CreateDirectory(directory);
+                    Console.WriteLine($"UploadTrackerService: Directory created: {directory}");
+                }
+
+                // Use a StreamWriter with a lock for append operations
+                Console.WriteLine($"UploadTrackerService: Attempting to append Post ID '{postId}' to file: '{_logFilePath}'.");
+                lock (_fileLock)
+                {
+                    // AppendAllTextAsync is generally safe, but explicit StreamWriter with lock is more robust for shared access patterns
+                    // However, for a simple append, File.AppendAllTextAsync should be fine.
+                    // Let's ensure the async version is used correctly.
+                    File.AppendAllText(_logFilePath, postId + Environment.NewLine); // Switched to synchronous for simplicity within lock
+                }
+                // For truly async, you'd need an AsyncLock or SemaphoreSlim if multiple threads could call this.
+                // For this console app, direct File.AppendAllTextAsync outside a tight lock might be okay,
+                // but let's keep it simple and robust for now.
+                // await File.AppendAllTextAsync(_logFilePath, postId + Environment.NewLine); 
+
+                Console.WriteLine($"UploadTrackerService: Successfully appended. Post ID '{postId}' logged as processed to '{Path.GetFileName(_logFilePath)}'.");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"UploadTrackerService Error: Failed to log post ID '{postId}' to file '{_logFilePath}'. Exception: {ex.ToString()}");
+                // If file write fails, we might consider removing it from the in-memory cache to allow a retry on next run,
+                // but this could lead to repeated processing attempts if the file error is persistent.
+                // For now, if it's in memory, it's considered "attempted to log" for this session.
+            }
+        }
+    }
+}
+// VideoOptions.cs (in RedditVideoMaker.Core project)
+using System.Collections.Generic;
+
+namespace RedditVideoMaker.Core
+{
+    public class VideoOptions
+    {
+        public const string SectionName = "VideoOptions";
+        public string OutputResolution { get; set; } = "1080x1920";
+        public string Theme { get; set; } = "dark";
+
+        public string? BackgroundVideoPath { get; set; }
+        public int CardWidth { get; set; } = 800;
+        public int CardHeight { get; set; } = 600;
+        public string CardBackgroundColor { get; set; } = "DarkSlateGray";
+        public string CardFontColor { get; set; } = "White";
+        public string CardMetadataFontColor { get; set; } = "LightGray";
+        public int NumberOfCommentsToInclude { get; set; } = 3;
+
+        public bool EnableTransitions { get; set; } = true;
+        public double TransitionDurationSeconds { get; set; } = 0.5;
+
+        public float ContentTargetFontSize { get; set; } = 36f;
+        public float ContentMinFontSize { get; set; } = 16f;
+        public float ContentMaxFontSize { get; set; } = 60f;
+        public float MetadataTargetFontSize { get; set; } = 24f;
+        public float MetadataMinFontSize { get; set; } = 12f;
+        public float MetadataMaxFontSize { get; set; } = 32f;
+
+        public bool CleanUpIntermediateFiles { get; set; } = true;
+
+        public string? IntroVideoPath { get; set; }
+        public string? OutroVideoPath { get; set; }
+
+        public string? BackgroundMusicFilePath { get; set; }
+        public double BackgroundMusicVolume { get; set; } = 0.15;
+
+        public string PrimaryFontFilePath { get; set; } = "Fonts/DejaVuSans.ttf";
+        public string FallbackFontName { get; set; } = "Arial";
+
+        // New property for Step 29: Assets Folder
+        /// <summary>
+        /// The root directory name for assets (e.g., "assets"), relative to the application execution path.
+        /// Paths like BackgroundVideoPath, BackgroundMusicFilePath, IntroVideoPath, OutroVideoPath
+        /// will be treated as relative to this directory if they are not absolute paths.
+        /// </summary>
+        public string AssetsRootDirectory { get; set; } = "assets";
+    }
+}
+// VideoService.cs (in RedditVideoMaker.Core project)
+using System;
+using System.IO;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using FFMpegCore;
+using FFMpegCore.Enums;
+using FFMpegCore.Arguments;
+using System.Linq;
+using System.Text;
+using System.Globalization;
+using Microsoft.Extensions.Options; // For IOptions
+
+namespace RedditVideoMaker.Core
+{
+    public class VideoService
+    {
+        private readonly VideoOptions _videoOptions;
+
+        public VideoService(IOptions<VideoOptions> videoOptions)
+        {
+            _videoOptions = videoOptions.Value;
+        }
+
+        public async Task<bool> CreateClipWithBackgroundAsync(
+            string visualBackgroundVideoPath,
+            string overlayCardPath,
+            string ttsAudioPath,
+            string outputClipPath,
+            int finalVideoWidth,
+            int finalVideoHeight)
+        {
+            if (string.IsNullOrWhiteSpace(visualBackgroundVideoPath) || !File.Exists(visualBackgroundVideoPath))
+            { Console.Error.WriteLine($"VideoService Error: Visual background video not found at resolved path: {visualBackgroundVideoPath}"); return false; }
+            if (!File.Exists(overlayCardPath)) { Console.Error.WriteLine($"VideoService Error: Overlay card image not found: {overlayCardPath}"); return false; }
+            if (!File.Exists(ttsAudioPath)) { Console.Error.WriteLine($"VideoService Error: TTS audio not found: {ttsAudioPath}"); return false; }
+            if (string.IsNullOrWhiteSpace(outputClipPath)) { Console.Error.WriteLine("VideoService Error: Output clip path empty."); return false; }
+
+            try
+            {
+                string? directory = Path.GetDirectoryName(outputClipPath);
+                if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory)) Directory.CreateDirectory(directory);
+
+                IMediaAnalysis ttsAudioInfo = await FFProbe.AnalyseAsync(ttsAudioPath);
+                TimeSpan clipDuration = ttsAudioInfo.Duration;
+                if (clipDuration <= TimeSpan.Zero) { Console.Error.WriteLine($"VideoService Error: Invalid audio duration for {ttsAudioPath}."); return false; }
+
+                Console.WriteLine($"VideoService: Creating clip '{Path.GetFileName(outputClipPath)}'. Duration: {clipDuration}, Output Size: {finalVideoWidth}x{finalVideoHeight}");
+
+                if (finalVideoWidth % 2 != 0) finalVideoWidth++;
+                if (finalVideoHeight % 2 != 0) finalVideoHeight++;
+
+                var inputArguments = FFMpegArguments
+                    .FromFileInput(visualBackgroundVideoPath, false,
+                        opt => opt.WithCustomArgument("-stream_loop -1"))
+                    .AddFileInput(overlayCardPath, false,
+                        opt => {
+                            opt.WithCustomArgument("-loop 1");
+                            opt.WithCustomArgument($"-r {ttsAudioInfo.PrimaryVideoStream?.FrameRate ?? 25}");
+                        });
+
+                inputArguments.AddFileInput(ttsAudioPath);
+
+                var filterComplexBuilder = new StringBuilder();
+                string finalVideoMapLabel = "[vout]";
+                string finalAudioMapLabel;
+
+                filterComplexBuilder.Append(
+                    $"[0:v]scale={finalVideoWidth}:{finalVideoHeight}:force_original_aspect_ratio=decrease,pad={finalVideoWidth}:{finalVideoHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1[bg];" +
+                    $"[1:v]scale='iw*min(1,min({finalVideoWidth}*0.9/iw,{finalVideoHeight}*0.8/ih))':-1,format=rgba,trim=duration={clipDuration.TotalSeconds.ToString(CultureInfo.InvariantCulture)}[fg];" +
+                    $"[bg][fg]overlay=(W-w)/2:(H-h)/2:shortest=1{finalVideoMapLabel}"
+                );
+
+                string resolvedBackgroundMusicPath = string.Empty;
+                if (!string.IsNullOrWhiteSpace(_videoOptions.BackgroundMusicFilePath))
+                {
+                    resolvedBackgroundMusicPath = Path.IsPathRooted(_videoOptions.BackgroundMusicFilePath) ?
+                                                _videoOptions.BackgroundMusicFilePath :
+                                                Path.Combine(AppContext.BaseDirectory, _videoOptions.AssetsRootDirectory, _videoOptions.BackgroundMusicFilePath);
+                }
+
+                bool useBackgroundMusic = !string.IsNullOrWhiteSpace(resolvedBackgroundMusicPath) &&
+                                          File.Exists(resolvedBackgroundMusicPath) &&
+                                          _videoOptions.BackgroundMusicVolume > 0.0;
+
+                if (useBackgroundMusic)
+                {
+                    Console.WriteLine($"VideoService: Adding background music from '{resolvedBackgroundMusicPath}' at volume {_videoOptions.BackgroundMusicVolume}");
+                    inputArguments = inputArguments.AddFileInput(resolvedBackgroundMusicPath, false,
+                        opt => opt.WithCustomArgument("-stream_loop -1"));
+
+                    string musicVolume = _videoOptions.BackgroundMusicVolume.ToString(CultureInfo.InvariantCulture);
+                    double dropoutTransition = Math.Min(0.1, clipDuration.TotalSeconds / 10.0);
+                    dropoutTransition = Math.Max(0.01, dropoutTransition);
+
+                    filterComplexBuilder.Append(
+                        $";[3:a]volume={musicVolume},atrim=0:{clipDuration.TotalSeconds.ToString(CultureInfo.InvariantCulture)}[bgm_trimmed];" +
+                        $"[2:a][bgm_trimmed]amix=inputs=2:duration=first:dropout_transition={dropoutTransition.ToString(CultureInfo.InvariantCulture)}[aout_final]"
+                    );
+                    finalAudioMapLabel = "[aout_final]";
+                }
+                else
+                {
+                    filterComplexBuilder.Append($";[2:a]anull[aout_final]");
+                    finalAudioMapLabel = "[aout_final]";
+                }
+
+                var outputProcessor = inputArguments.OutputToFile(outputClipPath, true, options => {
+                    options.WithVideoCodec(VideoCodec.LibX264)
+                           .WithAudioCodec(AudioCodec.Aac)
+                           .WithAudioBitrate(192)
+                           .WithVideoBitrate(2500)
+                           .WithCustomArgument($"-filter_complex \"{filterComplexBuilder.ToString()}\"")
+                           .WithCustomArgument($"-map \"{finalVideoMapLabel}\"")
+                           .WithCustomArgument($"-map \"{finalAudioMapLabel}\"")
+                           .WithDuration(clipDuration)
+                           .WithCustomArgument("-preset medium")
+                           .UsingMultithreading(true)
+                           .WithFastStart();
+                });
+
+                bool success = await outputProcessor.ProcessAsynchronously();
+
+                if (success)
+                {
+                    Console.WriteLine($"VideoService: Clip with background (music: {useBackgroundMusic}) successfully created: {outputClipPath}");
+                    return true;
+                }
+                else
+                {
+                    Console.Error.WriteLine($"VideoService Error: FFmpeg processing failed for clip: {outputClipPath}.");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"VideoService Error: An unexpected error occurred during clip creation. {ex.Message}");
+                Console.Error.WriteLine($"Stack Trace: {ex.StackTrace}");
+                return false;
+            }
+        }
+
+        public async Task<bool> ConcatenateVideosAsync(List<string> videoClipPaths, string outputVideoPath)
+        {
+            if (videoClipPaths == null || !videoClipPaths.Any()) { Console.Error.WriteLine("VideoService Error: No video clips for concatenation."); return false; }
+            foreach (var clipPath in videoClipPaths) { if (!File.Exists(clipPath)) { Console.Error.WriteLine($"VideoService Error: Input clip for concat not found: {clipPath}"); return false; } }
+            if (string.IsNullOrWhiteSpace(outputVideoPath)) { Console.Error.WriteLine("VideoService Error: Output path for concat empty."); return false; }
+
+            if (videoClipPaths.Count == 1)
+            {
+                try
+                {
+                    File.Copy(videoClipPaths[0], outputVideoPath, true);
+                    Console.WriteLine($"VideoService: Single clip copied to {outputVideoPath}"); return true;
+                }
+                catch (Exception ex) { Console.Error.WriteLine($"VideoService Error: Failed to copy single clip. {ex.Message}"); return false; }
+            }
+
+            Console.WriteLine($"VideoService: Starting concatenation of {videoClipPaths.Count} clips into {Path.GetFileName(outputVideoPath)}.");
+            if (_videoOptions.EnableTransitions && videoClipPaths.Count > 1)
+            {
+                Console.WriteLine($"VideoService: Transitions ENABLED, target duration: {_videoOptions.TransitionDurationSeconds}s.");
+            }
+            else
+            {
+                Console.WriteLine("VideoService: Transitions DISABLED (or only 1 clip). Using simple concat filter (re-encoding).");
+            }
+
+            try
+            {
+                FFMpegArguments arguments;
+                var filterComplexBuilder = new StringBuilder();
+                string finalOutputVideoLabel = "[vout]";
+                string finalOutputAudioLabel = "[aout]";
+
+                // Initialize arguments with the first input file
+                arguments = FFMpegArguments.FromFileInput(videoClipPaths[0]);
+                for (int i = 1; i < videoClipPaths.Count; i++) // Add subsequent inputs
+                {
+                    arguments.AddFileInput(videoClipPaths[i]);
+                }
+
+                if (_videoOptions.EnableTransitions && videoClipPaths.Count > 1)
+                {
+                    var clipDurations = new List<TimeSpan>();
+                    for (int i = 0; i < videoClipPaths.Count; i++)
+                    {
+                        var mediaInfo = await FFProbe.AnalyseAsync(videoClipPaths[i]);
+                        if (mediaInfo.Duration <= TimeSpan.Zero)
+                        {
+                            Console.Error.WriteLine($"VideoService Error: Could not get valid duration for clip {videoClipPaths[i]} for transition calculation. Falling back.");
+                            return await ConcatenateWithoutTransitions(videoClipPaths, outputVideoPath);
+                        }
+                        clipDurations.Add(mediaInfo.Duration);
+                    }
+
+                    double effectiveTransitionDuration = _videoOptions.TransitionDurationSeconds;
+                    for (int i = 0; i < clipDurations.Count - 1; i++)
+                    {
+                        effectiveTransitionDuration = Math.Min(effectiveTransitionDuration, clipDurations[i].TotalSeconds * 0.499);
+                        effectiveTransitionDuration = Math.Min(effectiveTransitionDuration, clipDurations[i + 1].TotalSeconds * 0.499);
+                    }
+                    effectiveTransitionDuration = Math.Max(0.01, effectiveTransitionDuration);
+
+                    if (effectiveTransitionDuration < 0.02)
+                    {
+                        Console.WriteLine($"VideoService Warning: Effective transition duration ({effectiveTransitionDuration}s) is very short. Falling back to simple concat.");
+                        return await ConcatenateWithoutTransitions(videoClipPaths, outputVideoPath);
+                    }
+                    Console.WriteLine($"VideoService: Using effective transition duration: {effectiveTransitionDuration}s for xfade/acrossfade.");
+
+                    string currentVideo = "[0:v]";
+                    string currentAudio = "[0:a]";
+                    // Removed unused 'accumulatedOffset'
+
+                    for (int i = 0; i < videoClipPaths.Count - 1; i++)
+                    {
+                        string nextVideo = $"[{i + 1}:v]";
+                        string nextAudio = $"[{i + 1}:a]";
+                        string tempVideoOut = (i == videoClipPaths.Count - 2) ? finalOutputVideoLabel : $"[v{i + 1}]";
+                        string tempAudioOut = (i == videoClipPaths.Count - 2) ? finalOutputAudioLabel : $"[a{i + 1}]";
+
+                        // xfade offset is relative to the start of the first video in the pair.
+                        double xfadeStartOffsetInCurrentClip = clipDurations[i].TotalSeconds - effectiveTransitionDuration;
+
+                        filterComplexBuilder.Append($"{currentVideo}{nextVideo}xfade=transition=fade:duration={effectiveTransitionDuration.ToString(CultureInfo.InvariantCulture)}:offset={xfadeStartOffsetInCurrentClip.ToString(CultureInfo.InvariantCulture)}{tempVideoOut};");
+                        filterComplexBuilder.Append($"{currentAudio}{nextAudio}acrossfade=d={effectiveTransitionDuration.ToString(CultureInfo.InvariantCulture)}{tempAudioOut};");
+
+                        currentVideo = tempVideoOut;
+                        currentAudio = tempAudioOut;
+                    }
+                }
+                else
+                {
+                    // Simple concat filter
+                    for (int i = 0; i < videoClipPaths.Count; i++)
+                    {
+                        filterComplexBuilder.Append($"[{i}:v:0][{i}:a:0]");
+                    }
+                    filterComplexBuilder.Append($"concat=n={videoClipPaths.Count}:v=1:a=1{finalOutputVideoLabel}{finalOutputAudioLabel}");
+                }
+
+                if (filterComplexBuilder.Length > 0 && filterComplexBuilder[filterComplexBuilder.Length - 1] == ';')
+                {
+                    filterComplexBuilder.Length--;
+                }
+
+                bool success = await arguments
+                    .OutputToFile(outputVideoPath, true, options => options
+                        .WithVideoCodec(VideoCodec.LibX264)
+                        .WithAudioCodec(AudioCodec.Aac)
+                        .WithAudioBitrate(192)
+                        .WithVideoBitrate(2500)
+                        .WithCustomArgument($"-filter_complex \"{filterComplexBuilder.ToString()}\"")
+                        .WithCustomArgument($"-map \"{finalOutputVideoLabel}\"")
+                        .WithCustomArgument($"-map \"{finalOutputAudioLabel}\"")
+                        .WithCustomArgument("-preset medium")
+                        .WithFastStart())
+                    .ProcessAsynchronously();
+
+                if (success) { Console.WriteLine($"VideoService: Concatenation successful: {outputVideoPath}"); return true; }
+                else { Console.Error.WriteLine($"VideoService Error: FFmpeg concatenation failed for {outputVideoPath}."); return false; }
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"VideoService Error: Unexpected error during concat. {ex.Message} {ex.StackTrace}"); return false; }
+        }
+
+        private async Task<bool> ConcatenateWithoutTransitions(List<string> videoClipPaths, string outputVideoPath)
+        {
+            Console.WriteLine("VideoService: Using simple concat filter (no transitions) as fallback for re-encoding.");
+            // Start by adding all inputs for the filter_complex
+            FFMpegArguments arguments = FFMpegArguments.FromFileInput(videoClipPaths[0]);
+            for (int i = 1; i < videoClipPaths.Count; i++) // Start from 1 as first is already added
+            {
+                arguments.AddFileInput(videoClipPaths[i]);
+            }
+
+            var sb = new StringBuilder();
+            for (int i = 0; i < videoClipPaths.Count; i++)
+            {
+                sb.Append($"[{i}:v:0][{i}:a:0]");
+            }
+            sb.Append($"concat=n={videoClipPaths.Count}:v=1:a=1[vout][aout]");
+
+            return await arguments
+                .OutputToFile(outputVideoPath, true, options => options
+                    .WithVideoCodec(VideoCodec.LibX264)
+                    .WithAudioCodec(AudioCodec.Aac)
+                    .WithAudioBitrate(192)
+                    .WithVideoBitrate(2500)
+                    .WithCustomArgument($"-filter_complex \"{sb.ToString()}\"")
+                    .WithCustomArgument("-map \"[vout]\"")
+                    .WithCustomArgument("-map \"[aout]\"")
+                    .WithCustomArgument("-preset medium")
+                    .WithFastStart())
+                .ProcessAsynchronously();
+        }
+    }
+}
+// YouTubeOptions.cs (in RedditVideoMaker.Core project)
+using System.Collections.Generic;
+
+namespace RedditVideoMaker.Core
+{
+    public class YouTubeOptions
+    {
+        public const string SectionName = "YouTubeOptions";
+
+        public string? ClientSecretJsonPath { get; set; }
+        public string DefaultVideoTitle { get; set; } = "Reddit Story Video";
+        public string DefaultVideoDescription { get; set; } = "An interesting story from Reddit.";
+        public List<string> DefaultVideoTags { get; set; } = new List<string> { "reddit", "story" };
+        public string DefaultVideoCategoryId { get; set; } = "24";
+        public string DefaultVideoPrivacyStatus { get; set; } = "private";
+
+        // New properties for Step 28: Duplicate Upload Prevention
+        /// <summary>
+        /// If true, the application will check a local log to prevent re-uploading videos for the same Reddit post ID.
+        /// </summary>
+        public bool EnableDuplicateCheck { get; set; } = true; // Default to true
+
+        /// <summary>
+        /// Path to the file that logs IDs of successfully uploaded Reddit posts.
+        /// Can be a relative path (e.g., "uploaded_posts.log") or an absolute path.
+        /// </summary>
+        public string UploadedPostsLogPath { get; set; } = "uploaded_post_ids.log";
+    }
+}
+// YouTubeService.cs (in RedditVideoMaker.Core project)
+using System;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Google.Apis.Auth.OAuth2;
+using Google.Apis.Services;
+using Google.Apis.Upload;
+using Google.Apis.YouTube.v3; // This namespace contains the YouTubeService class with the Scope enum
+using Google.Apis.YouTube.v3.Data;
+using Microsoft.Extensions.Options;
+
+namespace RedditVideoMaker.Core
+{
+    public class YouTubeService // This is our custom service class
+    {
+        private readonly YouTubeOptions _youTubeOptions;
+        private const string UserCredentialsFolderName = "MyYouTubeCredentials"; // Folder to store OAuth tokens
+
+        public YouTubeService(IOptions<YouTubeOptions> youTubeOptions)
+        {
+            _youTubeOptions = youTubeOptions.Value;
+        }
+
+        private async Task<UserCredential> AuthorizeAsync()
+        {
+            if (string.IsNullOrWhiteSpace(_youTubeOptions.ClientSecretJsonPath) || !File.Exists(_youTubeOptions.ClientSecretJsonPath))
+            {
+                throw new FileNotFoundException("YouTube client_secret.json path is not configured or file not found. Please check appsettings.json.", _youTubeOptions.ClientSecretJsonPath);
+            }
+
+            UserCredential credential;
+            using (var stream = new FileStream(_youTubeOptions.ClientSecretJsonPath, FileMode.Open, FileAccess.Read))
+            {
+                string credPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), UserCredentialsFolderName);
+
+                credential = await GoogleWebAuthorizationBroker.AuthorizeAsync(
+                    GoogleClientSecrets.FromStream(stream).Secrets,
+                    // Corrected: Scopes are part of Google.Apis.YouTube.v3.YouTubeService
+                    new[] { Google.Apis.YouTube.v3.YouTubeService.Scope.YoutubeUpload, Google.Apis.YouTube.v3.YouTubeService.Scope.Youtube },
+                    "user",
+                    CancellationToken.None,
+                    new Google.Apis.Util.Store.FileDataStore(credPath, true)
+                );
+                Console.WriteLine($"YouTubeService: Credential file saved/loaded from: {credPath}");
+            }
+            return credential;
+        }
+
+        public async Task<Video?> UploadVideoAsync(string videoPath, string title, string description, string[] tags, string categoryId, string privacyStatus)
+        {
+            if (!File.Exists(videoPath))
+            {
+                Console.Error.WriteLine($"YouTubeService Error: Video file not found at {videoPath}");
+                return null;
+            }
+
+            try
+            {
+                UserCredential credential = await AuthorizeAsync();
+
+                // Use the fully qualified name for Google's YouTubeService to avoid confusion if necessary,
+                // though the 'using Google.Apis.YouTube.v3;' should make it clear.
+                var youtubeService = new Google.Apis.YouTube.v3.YouTubeService(new BaseClientService.Initializer()
+                {
+                    HttpClientInitializer = credential,
+                    ApplicationName = "Reddit Video Maker Bot C#"
+                });
+
+                var video = new Video();
+                video.Snippet = new VideoSnippet
+                {
+                    Title = title,
+                    Description = description,
+                    Tags = tags,
+                    CategoryId = categoryId
+                };
+                video.Status = new VideoStatus
+                {
+                    PrivacyStatus = privacyStatus
+                };
+
+                Console.WriteLine($"YouTubeService: Starting upload of '{Path.GetFileName(videoPath)}' with title '{title}'...");
+
+                using (var fileStream = new FileStream(videoPath, FileMode.Open, FileAccess.Read))
+                {
+                    var videosInsertRequest = youtubeService.Videos.Insert(video, "snippet,status", fileStream, "video/*");
+                    videosInsertRequest.ProgressChanged += OnUploadProgress;
+                    videosInsertRequest.ResponseReceived += OnUploadResponse;
+
+                    IUploadProgress uploadStatus = await videosInsertRequest.UploadAsync();
+
+                    if (uploadStatus.Status == UploadStatus.Completed)
+                    {
+                        Console.WriteLine("YouTubeService: Video upload completed successfully!");
+                        return videosInsertRequest.ResponseBody;
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine($"YouTubeService Error: Video upload failed. Status: {uploadStatus.Status}");
+                        if (uploadStatus.Exception != null)
+                        {
+                            Console.Error.WriteLine($"YouTubeService Exception: {uploadStatus.Exception.Message}");
+                        }
+                        return null;
+                    }
+                }
+            }
+            catch (FileNotFoundException fnfEx)
+            {
+                Console.Error.WriteLine($"YouTubeService Error: {fnfEx.Message}");
+                return null;
+            }
+            catch (AggregateException ex)
+            {
+                foreach (var e in ex.InnerExceptions)
+                {
+                    Console.Error.WriteLine("YouTubeService AggregateException: " + e.Message);
+                }
+                Console.Error.WriteLine("YouTubeService Error: An aggregate error occurred during YouTube upload. This can happen during the OAuth flow if you cancel or if there's a network issue.");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"YouTubeService Error: An unexpected error occurred during YouTube upload. {ex.Message}");
+                Console.Error.WriteLine($"Stack Trace: {ex.StackTrace}");
+                return null;
+            }
+        }
+
+        private void OnUploadProgress(IUploadProgress progress)
+        {
+            switch (progress.Status)
+            {
+                case UploadStatus.Uploading:
+                    Console.WriteLine($"YouTubeService: Uploading... {progress.BytesSent} bytes sent.");
+                    break;
+                case UploadStatus.Failed:
+                    Console.Error.WriteLine($"YouTubeService Error: An error prevented the upload from completing.\n{progress.Exception}");
+                    break;
+            }
+        }
+
+        private void OnUploadResponse(Video video)
+        {
+            Console.WriteLine($"YouTubeService: Upload Response Received. Video ID: {video.Id}, Title: '{video.Snippet.Title}' was successfully uploaded.");
+        }
+    }
+}
+using System;
+using System.IO;
+using System.Linq;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using RedditVideoMaker.Core; // This should bring in all Core classes and enums
+using FFMpegCore;
+using SixLabors.Fonts;
+
+public class Program
+{
+    // Helper function to resolve asset paths
+    private static string ResolveAssetPath(string? configuredPath, string assetsRootDirectory, string appBaseDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return string.Empty;
+
+        if (Path.IsPathRooted(configuredPath))
+            return configuredPath;
+
+        return Path.GetFullPath(Path.Combine(appBaseDirectory, assetsRootDirectory, configuredPath));
+    }
+
+    public static async Task Main(string[] args)
+    {
+        TextWriter originalConsoleOut = Console.Out;
+        TextWriter originalConsoleError = Console.Error;
+
+        string appBaseDirectoryForPaths = AppContext.BaseDirectory;
+
+        var initialConfigForLogging = new ConfigurationBuilder()
+            .SetBasePath(Directory.GetCurrentDirectory())
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+            .Build();
+
+        string logDirFromJson = initialConfigForLogging.GetValue<string>("GeneralOptions:LogFileDirectory") ?? "logs";
+        int retentionDaysFromJson = initialConfigForLogging.GetValue<int?>("GeneralOptions:LogFileRetentionDays") ?? 7;
+        string consoleLevelStringFromJson = initialConfigForLogging.GetValue<string>("GeneralOptions:ConsoleOutputLevel") ?? "Detailed";
+
+        // ConsoleLogLevel enum comes from RedditVideoMaker.Core.GeneralOptions
+        if (!Enum.TryParse<ConsoleLogLevel>(consoleLevelStringFromJson, true, out ConsoleLogLevel consoleLogLevel))
+        {
+            consoleLogLevel = ConsoleLogLevel.Detailed;
+            originalConsoleError.WriteLine($"Warning: Invalid ConsoleOutputLevel '{consoleLevelStringFromJson}' in appsettings.json. Defaulting to '{consoleLogLevel}'.");
+        }
+
+        string fullLogDirectoryPath = Path.Combine(appBaseDirectoryForPaths, logDirFromJson);
+
+        FileLogger.Initialize(fullLogDirectoryPath, consoleLogLevel);
+        FileLogger.CleanupOldLogFiles(retentionDaysFromJson);
+
+        Console.WriteLine($"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC] Application Startup.");
+
+        try
+        {
+            string ffmpegBinFolder = Path.Combine(appBaseDirectoryForPaths, "ffmpeg_bin");
+            if (Directory.Exists(ffmpegBinFolder) && File.Exists(Path.Combine(ffmpegBinFolder, "ffmpeg.exe")) && File.Exists(Path.Combine(ffmpegBinFolder, "ffprobe.exe")))
+            { GlobalFFOptions.Configure(new FFOptions { BinaryFolder = ffmpegBinFolder }); Console.WriteLine($"FFMpegCore: Configured from: {ffmpegBinFolder}"); }
+            else { Console.Error.WriteLine($"FFMpegCore Error: ffmpeg_bin or executables not found at {ffmpegBinFolder}. Using PATH if available."); }
+
+            Console.WriteLine("\nReddit Video Maker Bot C# - Step 29: Configurable Assets Folder");
+
+            IConfiguration configuration = initialConfigForLogging;
+
+            var services = new ServiceCollection();
+            services.Configure<GeneralOptions>(configuration.GetSection(GeneralOptions.SectionName));
+            services.Configure<RedditOptions>(configuration.GetSection(RedditOptions.SectionName));
+            services.Configure<VideoOptions>(configuration.GetSection(VideoOptions.SectionName));
+            services.Configure<TtsOptions>(configuration.GetSection(TtsOptions.SectionName));
+            services.Configure<YouTubeOptions>(configuration.GetSection(YouTubeOptions.SectionName));
+
+            services.AddSingleton<RedditService>();
+            services.AddSingleton<TtsService>();
+            services.AddSingleton<ImageService>();
+            services.AddSingleton<VideoService>();
+            services.AddSingleton<YouTubeService>();
+            services.AddSingleton<UploadTrackerService>();
+
+            var serviceProvider = services.BuildServiceProvider();
+
+            var generalOptions = serviceProvider.GetService<IOptions<GeneralOptions>>()?.Value;
+            var redditOptions = serviceProvider.GetService<IOptions<RedditOptions>>()?.Value;
+            var videoOptions = serviceProvider.GetService<IOptions<VideoOptions>>()?.Value;
+            var ttsOptions = serviceProvider.GetService<IOptions<TtsOptions>>()?.Value;
+            var youtubeOptions = serviceProvider.GetService<IOptions<YouTubeOptions>>()?.Value;
+
+            if (generalOptions == null || redditOptions == null || videoOptions == null || ttsOptions == null || youtubeOptions == null)
+            { Console.Error.WriteLine("Error: One or more options sections not configured properly in appsettings.json."); return; }
+
+            if (string.IsNullOrWhiteSpace(redditOptions.PostUrl) && string.IsNullOrWhiteSpace(redditOptions.Subreddit))
+            { Console.Error.WriteLine("Error: Either PostUrl or Subreddit must be configured in RedditOptions in appsettings.json."); return; }
+
+            string resolvedBackgroundVideoPath = ResolveAssetPath(videoOptions.BackgroundVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths);
+
+            Console.WriteLine($"Testing Mode Enabled: {generalOptions.IsInTestingModule}");
+            Console.WriteLine($"Actual Console Output Level in use by FileLogger: {consoleLogLevel}");
+            Console.WriteLine($"Duplicate Upload Check Enabled: {youtubeOptions.EnableDuplicateCheck}");
+            Console.WriteLine($"Primary Font Path (relative to app): {videoOptions.PrimaryFontFilePath}");
+            Console.WriteLine($"Assets Root Directory (relative to app): {videoOptions.AssetsRootDirectory}");
+            Console.WriteLine($"Configured Background Video Path: {videoOptions.BackgroundVideoPath}, Resolved to: {resolvedBackgroundVideoPath}");
+
+            if (string.IsNullOrWhiteSpace(resolvedBackgroundVideoPath) || !File.Exists(resolvedBackgroundVideoPath))
+            { Console.Error.WriteLine($"Error: BackgroundVideoPath is not configured or file not found. Configured: '{videoOptions.BackgroundVideoPath}', Attempted: '{resolvedBackgroundVideoPath}'. Please check appsettings.json and ensure the file exists in the '{videoOptions.AssetsRootDirectory}' folder or is a valid absolute path."); return; }
+
+            if (!string.IsNullOrWhiteSpace(videoOptions.BackgroundMusicFilePath) &&
+                !File.Exists(ResolveAssetPath(videoOptions.BackgroundMusicFilePath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)) &&
+                videoOptions.BackgroundMusicVolume > 0)
+            { Console.Error.WriteLine($"Warning: BackgroundMusicFilePath is specified ('{videoOptions.BackgroundMusicFilePath}') but resolved file not found at '{ResolveAssetPath(videoOptions.BackgroundMusicFilePath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)}'. Background music will be skipped."); }
+
+            if (!string.IsNullOrWhiteSpace(videoOptions.IntroVideoPath) &&
+                !File.Exists(ResolveAssetPath(videoOptions.IntroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)))
+            { Console.Error.WriteLine($"Warning: IntroVideoPath is specified ('{videoOptions.IntroVideoPath}') but resolved file not found at '{ResolveAssetPath(videoOptions.IntroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)}'. Intro video will be skipped."); }
+
+            if (!string.IsNullOrWhiteSpace(videoOptions.OutroVideoPath) &&
+                !File.Exists(ResolveAssetPath(videoOptions.OutroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)))
+            { Console.Error.WriteLine($"Warning: OutroVideoPath is specified ('{videoOptions.OutroVideoPath}') but resolved file not found at '{ResolveAssetPath(videoOptions.OutroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths)}'. Outro video will be skipped."); }
+
+            if (!generalOptions.IsInTestingModule && (string.IsNullOrWhiteSpace(youtubeOptions.ClientSecretJsonPath) || !File.Exists(youtubeOptions.ClientSecretJsonPath)))
+            { Console.Error.WriteLine($"Error: YouTube ClientSecretJsonPath is not configured or file not found. This is required when not in testing mode."); return; }
+
+            var redditService = serviceProvider.GetRequiredService<RedditService>();
+            var ttsService = serviceProvider.GetRequiredService<TtsService>();
+            var imageService = serviceProvider.GetRequiredService<ImageService>();
+            var videoService = serviceProvider.GetRequiredService<VideoService>();
+            var youTubeService = serviceProvider.GetRequiredService<YouTubeService>();
+            var uploadTracker = serviceProvider.GetRequiredService<UploadTrackerService>();
+
+            Console.WriteLine($"\nAttempting to select Reddit post(s) based on configuration...");
+            // GetTopPostsAsync now uses options injected into RedditService and returns a List
+            List<RedditPostData> postsToProcess = await redditService.GetTopPostsAsync();
+
+            if (postsToProcess == null || !postsToProcess.Any())
+            {
+                Console.WriteLine("No suitable posts found to process.");
+            }
+            else
+            {
+                int postCounter = 0;
+                foreach (var selectedPost in postsToProcess)
+                {
+                    postCounter++;
+                    Console.WriteLine($"\n--- Checking Post {postCounter} of {postsToProcess.Count}: \"{selectedPost.Title}\" (ID: {selectedPost.Id}) ---");
+
+                    if (string.IsNullOrWhiteSpace(selectedPost.Id) || string.IsNullOrWhiteSpace(selectedPost.Subreddit) || string.IsNullOrWhiteSpace(selectedPost.Title))
+                    {
+                        Console.Error.WriteLine($"Skipping post {selectedPost.Id ?? "Unknown"} due to missing critical info.");
+                        continue;
+                    }
+
+                    // Use youtubeOptions.EnableDuplicateCheck
+                    if (youtubeOptions.EnableDuplicateCheck && uploadTracker.HasPostBeenUploaded(selectedPost.Id!))
+                    {
+                        Console.WriteLine($"Post ID '{selectedPost.Id}' has already been processed. Skipping.");
+                        continue;
+                    }
+
+                    Console.WriteLine($"Processing Post: {selectedPost.Title} by {selectedPost.Author} (Score: {selectedPost.Score})");
+
+                    List<string> individualVideoClips = new List<string>();
+                    List<string> intermediateFilesToClean = new List<string>();
+
+                    string baseOutputDir = Path.Combine(Directory.GetCurrentDirectory(), "output_files");
+                    string ttsDir = Path.Combine(baseOutputDir, "tts");
+                    string imgDir = Path.Combine(baseOutputDir, "images");
+                    string clipsDir = Path.Combine(baseOutputDir, "clips");
+                    string finalDir = Path.Combine(baseOutputDir, "final_video");
+                    Directory.CreateDirectory(ttsDir);
+                    Directory.CreateDirectory(imgDir);
+                    Directory.CreateDirectory(clipsDir);
+                    Directory.CreateDirectory(finalDir);
+
+                    int finalVideoWidth = 1080; int finalVideoHeight = 1920;
+                    if (!string.IsNullOrWhiteSpace(videoOptions.OutputResolution) && videoOptions.OutputResolution.Contains('x', StringComparison.OrdinalIgnoreCase))
+                    {
+                        var parts = videoOptions.OutputResolution.Split(new char[] { 'x', 'X' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
+                        { finalVideoWidth = w; finalVideoHeight = h; }
+                    }
+                    Console.WriteLine($"TTS Engine Configured (before Testing Mode override): {ttsOptions.Engine}");
+
+                    // Use imageService.LoadedFontFamily
+                    FontFamily? measuringFontFamily = imageService.LoadedFontFamily;
+                    if (measuringFontFamily == null)
+                    {
+                        Console.Error.WriteLine("Program.cs: Critical - No font could be loaded by ImageService. Text splitting for self-text will be skipped or may be inaccurate.");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Program.cs: Using font '{measuringFontFamily.Value.Name}' (from ImageService) for text measurement.");
+                    }
+
+                    // --- Add Intro Clip if specified ---
+                    string currentIntroPath = ResolveAssetPath(videoOptions.IntroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths);
+                    if (!string.IsNullOrWhiteSpace(currentIntroPath) && File.Exists(currentIntroPath))
+                    {
+                        Console.WriteLine($"Adding intro clip: {currentIntroPath}");
+                        individualVideoClips.Add(currentIntroPath);
+                    }
+
+                    // --- Process Post Title as a Clip ---
+                    Console.WriteLine($"\n--- Processing Post Title for post {selectedPost.Id} ---");
+                    string cleanedTitleForTts = TextUtilities.CleanTextForTts(selectedPost.Title!);
+                    string titleForCard = selectedPost.Title!;
+                    string titleId = $"post_{selectedPost.Id!.Replace(" ", "_")}";
+                    string titleTtsPath = Path.Combine(ttsDir, $"audio_{titleId}.wav");
+                    string titleCardPath = Path.Combine(imgDir, $"image_{titleId}.png");
+                    string titleClipPath = Path.Combine(clipsDir, $"clip_{titleId}.mp4");
+                    intermediateFilesToClean.Add(titleTtsPath); intermediateFilesToClean.Add(titleCardPath);
+
+                    if (await ttsService.TextToSpeechAsync(cleanedTitleForTts, titleTtsPath) &&
+                        await imageService.CreateRedditContentCardAsync(
+                            titleForCard, selectedPost.Author, selectedPost.Score, titleCardPath,
+                            videoOptions.CardWidth, videoOptions.CardHeight, videoOptions.CardBackgroundColor,
+                            videoOptions.CardFontColor, videoOptions.CardMetadataFontColor) &&
+                        await videoService.CreateClipWithBackgroundAsync(resolvedBackgroundVideoPath, titleCardPath, titleTtsPath, titleClipPath, finalVideoWidth, finalVideoHeight))
+                    {
+                        Console.WriteLine($"Title clip created: {titleClipPath}");
+                        individualVideoClips.Add(titleClipPath);
+                    }
+                    else { Console.Error.WriteLine($"Failed to process title clip for post {selectedPost.Id}."); }
+
+                    // --- Process Post Self-Text as a Clip (with splitting) ---
+                    if (!string.IsNullOrWhiteSpace(selectedPost.Selftext) && measuringFontFamily != null)
+                    {
+                        FontFamily actualMeasuringFontFamily = measuringFontFamily.Value;
+                        Font selfTextMeasuringFont = actualMeasuringFontFamily.CreateFont(videoOptions.ContentTargetFontSize, FontStyle.Regular);
+                        float textPadding = Math.Max(15f, Math.Min(videoOptions.CardWidth * 0.05f, videoOptions.CardHeight * 0.05f));
+                        float selfTextCardContentWidth = videoOptions.CardWidth - (2 * textPadding);
+                        float selfTextCardContentHeight = videoOptions.CardHeight - (2 * textPadding);
+                        List<string> selfTextPagesForTts = TextUtilities.SplitTextIntoPages(TextUtilities.CleanTextForTts(selectedPost.Selftext), selfTextMeasuringFont, selfTextCardContentWidth, selfTextCardContentHeight);
+                        List<string> selfTextPagesForCard = selfTextPagesForTts;
+                        Console.WriteLine($"Self-text split into {selfTextPagesForTts.Count} page(s).");
+                        int selfTextPageIndex = 0;
+                        for (int i = 0; i < selfTextPagesForTts.Count; i++)
+                        {
+                            string selfTextPageContentForTts = selfTextPagesForTts[i];
+                            string selfTextPageContentForCard = selfTextPagesForCard.Count > i ? selfTextPagesForCard[i] : selfTextPageContentForTts;
+                            if (string.IsNullOrWhiteSpace(selfTextPageContentForTts)) continue;
+                            selfTextPageIndex++;
+                            string selfTextId = $"post_{selectedPost.Id!}_selftext_p{selfTextPageIndex}";
+                            string selfTextPageTtsPath = Path.Combine(ttsDir, $"audio_{selfTextId}.wav");
+                            string selfTextPageCardPath = Path.Combine(imgDir, $"image_{selfTextId}.png");
+                            string selfTextPageClipPath = Path.Combine(clipsDir, $"clip_{selfTextId}.mp4");
+                            intermediateFilesToClean.Add(selfTextPageTtsPath); intermediateFilesToClean.Add(selfTextPageCardPath);
+                            string pageIndicator = selfTextPagesForTts.Count > 1 ? $" (Page {selfTextPageIndex}/{selfTextPagesForTts.Count})" : "";
+                            if (await ttsService.TextToSpeechAsync(selfTextPageContentForTts, selfTextPageTtsPath) &&
+                                await imageService.CreateRedditContentCardAsync(selfTextPageContentForCard + pageIndicator, null, null, selfTextPageCardPath, videoOptions.CardWidth, videoOptions.CardHeight, videoOptions.CardBackgroundColor, videoOptions.CardFontColor, videoOptions.CardMetadataFontColor) &&
+                                await videoService.CreateClipWithBackgroundAsync(resolvedBackgroundVideoPath, selfTextPageCardPath, selfTextPageTtsPath, selfTextPageClipPath, finalVideoWidth, finalVideoHeight))
+                            {
+                                Console.WriteLine($"Self-text clip (page {selfTextPageIndex}) created: {selfTextPageClipPath}");
+                                individualVideoClips.Add(selfTextPageClipPath);
+                            }
+                            else { Console.Error.WriteLine($"Failed to process self-text clip (page {selfTextPageIndex})."); }
+                        }
+                    }
+                    else if (string.IsNullOrWhiteSpace(selectedPost.Selftext))
+                    {
+                        Console.WriteLine("No self-text for this post.");
+                    }
+                    else if (measuringFontFamily == null)
+                    {
+                        Console.Error.WriteLine("Skipping self-text processing as no usable measuring font was available from ImageService.");
+                    }
+
+                    // --- Process Comments as Clips ---
+                    Console.WriteLine($"\nFetching comments for post ID: {selectedPost.Id} from subreddit /r/{selectedPost.Subreddit}...");
+                    int initialCommentFetchLimit = (videoOptions.NumberOfCommentsToInclude * 3) + 20;
+                    List<RedditCommentData>? fetchedComments = await redditService.GetCommentsAsync(selectedPost.Subreddit!, selectedPost.Id!, commentFetchLimit: initialCommentFetchLimit);
+
+                    if (fetchedComments != null && fetchedComments.Any())
+                    {
+                        var suitableComments = fetchedComments
+                            .Where(c => !string.IsNullOrWhiteSpace(c.Body) && c.Body.Length > 10)
+                            .Take(videoOptions.NumberOfCommentsToInclude)
+                            .ToList();
+                        Console.WriteLine($"\nProcessing {suitableComments.Count} suitable comments (target: {videoOptions.NumberOfCommentsToInclude})...");
+                        int idx = 0;
+                        foreach (var comment in suitableComments)
+                        {
+                            idx++;
+                            string cleanedCommentBodyForTts = TextUtilities.CleanTextForTts(comment.Body!);
+                            string commentBodyForCard = comment.Body!;
+                            string cId = $"{selectedPost.Id}_c{idx}_{comment.Id?.Replace(" ", "_").Replace(Path.DirectorySeparatorChar, '_').Replace(Path.AltDirectorySeparatorChar, '_') ?? Guid.NewGuid().ToString()}";
+                            string cTtsPath = Path.Combine(ttsDir, $"audio_{cId}.wav");
+                            string cCardPath = Path.Combine(imgDir, $"image_{cId}.png");
+                            string cClipPath = Path.Combine(clipsDir, $"clip_{cId}.mp4");
+                            intermediateFilesToClean.Add(cTtsPath); intermediateFilesToClean.Add(cCardPath);
+                            if (await ttsService.TextToSpeechAsync(cleanedCommentBodyForTts, cTtsPath) &&
+                                await imageService.CreateRedditContentCardAsync(commentBodyForCard, comment.Author, comment.Score, cCardPath, videoOptions.CardWidth, videoOptions.CardHeight, videoOptions.CardBackgroundColor, videoOptions.CardFontColor, videoOptions.CardMetadataFontColor) &&
+                                await videoService.CreateClipWithBackgroundAsync(resolvedBackgroundVideoPath, cCardPath, cTtsPath, cClipPath, finalVideoWidth, finalVideoHeight))
+                            {
+                                Console.WriteLine($"Comment clip {idx} created: {cClipPath}");
+                                individualVideoClips.Add(cClipPath);
+                            }
+                            else { Console.Error.WriteLine($"Failed to process comment clip {idx}."); }
+                        }
+                    }
+                    else { Console.WriteLine("No comments found for the post (or none met score criteria)."); }
+
+                    // --- Add Outro Clip if specified ---
+                    string currentOutroPath = ResolveAssetPath(videoOptions.OutroVideoPath, videoOptions.AssetsRootDirectory, appBaseDirectoryForPaths);
+                    if (!string.IsNullOrWhiteSpace(currentOutroPath) && File.Exists(currentOutroPath))
+                    {
+                        Console.WriteLine($"Adding outro clip: {currentOutroPath}");
+                        individualVideoClips.Add(currentOutroPath);
+                    }
+
+                    // --- Concatenate all video clips for the current post ---
+                    if (individualVideoClips.Any())
+                    {
+                        string finalVideoPath = Path.Combine(finalDir, $"final_video_{selectedPost.Id}.mp4");
+                        Console.WriteLine($"\nConcatenating {individualVideoClips.Count} clips for post {selectedPost.Id} into {finalVideoPath}...");
+                        bool concatenationSuccess = await videoService.ConcatenateVideosAsync(individualVideoClips, finalVideoPath);
+
+                        if (concatenationSuccess)
+                        {
+                            Console.WriteLine($"Final video created for post {selectedPost.Id}: {finalVideoPath}");
+
+                            if (youtubeOptions.EnableDuplicateCheck)
+                            {
+                                await uploadTracker.AddPostIdToLogAsync(selectedPost.Id!);
+                            }
+
+                            if (!generalOptions.IsInTestingModule)
+                            {
+                                Console.WriteLine($"\n--- Attempting YouTube Upload for post {selectedPost.Id} ---");
+                                string videoTitle = !string.IsNullOrWhiteSpace(selectedPost.Title) ? TextUtilities.CleanTextForTts(selectedPost.Title) : youtubeOptions.DefaultVideoTitle;
+                                string videoDescription = $"Reddit story from /r/{selectedPost.Subreddit}.\nOriginal post by u/{selectedPost.Author}.\n\n{youtubeOptions.DefaultVideoDescription}";
+                                if (!string.IsNullOrWhiteSpace(selectedPost.Selftext))
+                                { videoDescription += $"\n\nPost Text:\n{TextUtilities.CleanTextForTts(selectedPost.Selftext).Substring(0, Math.Min(TextUtilities.CleanTextForTts(selectedPost.Selftext).Length, 300))}..."; }
+
+                                var uploadedVideo = await youTubeService.UploadVideoAsync(
+                                    finalVideoPath, videoTitle, videoDescription, youtubeOptions.DefaultVideoTags.ToArray(),
+                                    youtubeOptions.DefaultVideoCategoryId, youtubeOptions.DefaultVideoPrivacyStatus
+                                );
+
+                                if (uploadedVideo != null)
+                                {
+                                    Console.WriteLine($"Successfully uploaded video! YouTube ID: {uploadedVideo.Id}");
+                                    Console.WriteLine($"Watch it at: https://www.youtube.com/watch?v={uploadedVideo.Id}");
+                                }
+                                else { Console.Error.WriteLine($"YouTube upload failed for post {selectedPost.Id}. Check previous logs."); }
+                            }
+                            else { Console.WriteLine($"\nTesting Mode: YouTube upload skipped for post {selectedPost.Id}."); }
+
+                            if (videoOptions.CleanUpIntermediateFiles)
+                            {
+                                Console.WriteLine($"Cleaning up intermediate files for post {selectedPost.Id}...");
+                                var generatedClipsForThisPost = individualVideoClips.Where(p => p.StartsWith(clipsDir));
+                                intermediateFilesToClean.AddRange(generatedClipsForThisPost);
+
+                                foreach (var filePath in intermediateFilesToClean)
+                                { try { if (File.Exists(filePath)) File.Delete(filePath); } catch (Exception ex) { Console.Error.WriteLine($"Error deleting file {filePath}: {ex.Message}"); } }
+                                Console.WriteLine($"Intermediate files cleanup process completed for post {selectedPost.Id}.");
+                            }
+                        }
+                        else { Console.Error.WriteLine($"Failed to concatenate video clips for post {selectedPost.Id}."); }
+                    }
+                    else { Console.WriteLine($"No video clips were generated for post {selectedPost.Id} to concatenate."); }
+                } // End of foreach post loop
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"CRITICAL UNHANDLED EXCEPTION in Main: {ex.ToString()}");
+            System.Console.Error.WriteLine("Application terminated due to a critical error.");
+        }
+        finally
+        {
+            Console.WriteLine("\nEnd of processing. All tasks completed.");
+            FileLogger.Dispose();
+            System.Console.Out.WriteLine("\nApplication finished. Press any key to exit.");
+            System.Console.Out.Flush();
+            try { System.Console.ReadKey(); }
+            catch (InvalidOperationException ioex)
+            { System.Console.Error.WriteLine($"Error during Console.ReadKey(): {ioex.Message}"); await Task.Delay(5000); }
+        }
+    }
+}
+
+//appsettings.json
+
+{
+  "GeneralOptions": {
+    "IsInTestingModule": true, // or false
+    "LogFileDirectory": "logs", // Or any other directory name you prefer
+    "LogFileRetentionDays": 7, // Or your desired number of days
+    "ConsoleOutputLevel": "Detailed" // Options: "Detailed", "Summary", "ErrorsOnly", "Quiet"
+  },
+  "RedditOptions": {
+    "Subreddit": "AskReddit",
+    "PostId": "top",
+    "AllowNsfw": false,
+    "PostUrl": null,
+    "MinPostUpvotes": 0,
+    "MinPostCommentsCount": 0,
+    "PostFilterStartDate": null,
+    "PostFilterEndDate": null,
+    "MinCommentScore": -1, // Or int.MinValue equivalent if you prefer for "no filter"
+    "SubredditPostsToScan": 50,
+    "BypassPostFilters": false,
+    "BypassCommentScoreFilter": false,
+
+    // New settings for Step 25: Advanced Comment Selection
+    "CommentSortOrder": "top", // Options: "confidence", "top", "new", "controversial", "old", "qa"
+    "CommentIncludeKeywords": [], // e.g., ["keyword1", "another keyword"] - empty means no keyword filter
+    // "CommentExcludeKeywords": [] // We can add this later if needed
+
+    // New setting for Step 26
+    "NumberOfVideosInBatch": 5 // Number of videos to generate, e.g., 3 or 5 for testing
+
+  },
+  "VideoOptions": {
+    "OutputResolution": "1920x1080",
+    "Theme": "dark",
+    "BackgroundVideoPath": "backgrounds/subway_surfers.mp4", // Ensure this path is correct
+    "CardWidth": 800,
+    "CardHeight": 800,
+    "CardBackgroundColor": "DarkSlateGray",
+    "CardFontColor": "White",
+    "CardMetadataFontColor": "LightCyan",
+    "NumberOfCommentsToInclude": 15,
+    "EnableTransitions": true, // New: true to enable crossfades, false to disable
+    "TransitionDurationSeconds": 0.1, // New: Duration of the crossfade in seconds
+    "ContentTargetFontSize": 36, // Target font size for main text (title, self-text, comment body)
+    "ContentMinFontSize": 16, // Minimum font size for main text
+    "ContentMaxFontSize": 60, // Maximum font size for main text
+    "MetadataTargetFontSize": 24, // Target font size for metadata (author, score)
+    "MetadataMinFontSize": 12, // Minimum font size for metadata
+    "MetadataMaxFontSize": 32, // Maximum font size for metadata
+    "CleanUpIntermediateFiles": true, // Set to true to delete intermediate files, false to keep them
+    // New settings for Step 29: Configurable Font
+    "PrimaryFontFilePath": "Fonts/DejaVuSans.ttf", // Path relative to app execution dir
+    "FallbackFontName": "Arial", // A common system font to try if primary fails
+    // New settings for Step 23: Background Music
+    "BackgroundMusicFilePath": "assets/music.mp3", // <-- Optional: Path to your music file
+    "BackgroundMusicVolume": 0, // Volume for background music (e.g., 0.0 to 1.0). 0 means no music.
+    // New settings for Step 21: Intro/Outro Clips
+    "IntroVideoPath": "", //"C:\\Users\\deank\\Downloads\\Videos\\testsignal.mp4", // <-- Optional: Path to your intro video
+    "OutroVideoPath": "", //"C:\\Users\\deank\\Downloads\\Videos\\static.mp4" // <-- Optional: Path to your outro video
+    // New setting for Step 29
+    "AssetsRootDirectory": "assets"
+
+  },
+  "TtsOptions": {
+    "Engine": "Azure", // Current options: "Azure", "SystemSpeech", "GoogleCloud"
+    "AzureSpeechKey": "6SMxClhTFPoD5BnwIGgWxow01AhKSdesSGlSs7ILHYF7IqxcygIXJQQJ99BEACYeBjFXJ3w3AAAYACOGXeY8",
+    "AzureSpeechRegion": "eastus",
+    "AzureVoiceName": "en-US-ChristopherNeural", // Example Azure voice
+
+    // New settings for Google Cloud TTS
+    "GoogleCloudCredentialsPath": "C:\\Users\\deank\\source\\repos\\RedditVideoMaker\\RedditVideoMaker.ConsoleApp\\google.json", // <-- IMPORTANT: Replace with the actual path to your JSON key file
+    "GoogleCloudVoiceName": "en-GB-News-K", // Optional: e.g., "en-US-Wavenet-D" or "en-GB-News-K"
+    "GoogleCloudLanguageCode": "en-GB" // Optional: e.g., "en-US", "en-GB"
+  },
+  "YouTubeOptions": { // <-- New Section for YouTube settings
+    "ClientSecretJsonPath": "C:\\Users\\deank\\source\\repos\\RedditVideoMaker\\RedditVideoMaker.ConsoleApp\\client_secret.json", // <-- IMPORTANT: Update this path
+    "DefaultVideoTitle": "My Reddit Video Test",
+    "DefaultVideoDescription": "Check out this interesting Reddit story!",
+    "DefaultVideoTags": [ "reddit", "story", "video" ],
+    "DefaultVideoCategoryId": "24", // "24" is typically "Entertainment". Check YouTube Data API docs for other category IDs.
+    "DefaultVideoPrivacyStatus": "private", // "private", "unlisted", or "public"
+
+    // New settings for Step 28: Duplicate Upload Prevention
+    "EnableDuplicateCheck": true, // Set to true to enable checking, false to disable
+    "UploadedPostsLogPath": "uploaded_post_ids.log" // Path to the log file (can be relative to app execution)
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft": "Warning",
+      "Microsoft.Hosting.Lifetime": "Information"
+    }
+  }
+}

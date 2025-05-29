@@ -1,0 +1,69 @@
+﻿<Window x:Class="RedditVideoMaker.UI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:RedditVideoMaker.UI" 
+        mc:Ignorable="d"
+        Title="Reddit Video Maker" Height="720" Width="1280">
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Orientation="Vertical" Margin="0,0,0,10">
+            <TextBlock Text="Reddit Content Source:" FontWeight="Bold"/>
+            <StackPanel Orientation="Horizontal" Margin="0,5,0,5">
+                <RadioButton Content="Fetch by Post URL" GroupName="FetchMode" IsChecked="{Binding IsFetchByUrlMode}"/>
+                <RadioButton Content="Fetch from Subreddit" GroupName="FetchMode" IsChecked="{Binding IsFetchBySubredditMode}"/>
+            </StackPanel>
+
+            <StackPanel Orientation="Horizontal" Visibility="{Binding IsFetchByUrlMode, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <Label Content="Post URL:" Width="100"/>
+                <TextBox Text="{Binding PostUrlInput, UpdateSourceTrigger=PropertyChanged}" Width="400" Margin="5"/>
+            </StackPanel>
+
+            <StackPanel Orientation="Vertical" Visibility="{Binding IsFetchBySubredditMode, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <StackPanel Orientation="Horizontal">
+                    <Label Content="Subreddit (e.g., AskReddit):" Width="150"/>
+                    <TextBox Text="{Binding SubredditInput, UpdateSourceTrigger=PropertyChanged}" Width="200" Margin="5"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <Label Content="Sort (top, hot, new):" Width="150"/>
+                    <TextBox Text="{Binding SortInput, UpdateSourceTrigger=PropertyChanged}" Width="100" Margin="5"/>
+                </StackPanel>
+            </StackPanel>
+        </StackPanel>
+
+        <StackPanel Grid.Row="1" Orientation="Vertical" Margin="0,0,0,10">
+            <TextBlock Text="Video Configuration:" FontWeight="Bold"/>
+            <StackPanel Orientation="Horizontal">
+                <Label Content="Number of Comments:" Width="150"/>
+                <TextBox Text="{Binding NumberOfCommentsToInclude, UpdateSourceTrigger=PropertyChanged}" Width="50" Margin="5"/>
+            </StackPanel>
+            <CheckBox Content="Bypass Post Filters" IsChecked="{Binding BypassPostFilters}" Margin="5"/>
+        </StackPanel>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,10,0,10">
+            <Button Content="Generate Video" 
+                    Command="{Binding GenerateVideoCommand}" 
+                    Width="150" Height="30" Margin="5"
+                    IsEnabled="{Binding IsNotGenerating}"/>
+            <Button Content="Open Settings" 
+                    Command="{Binding OpenSettingsCommand}" 
+                    Width="120" Height="30" Margin="5"
+                    IsEnabled="{Binding IsNotGenerating}"/>
+        </StackPanel>
+
+        <TextBlock Grid.Row="3" Text="{Binding CurrentStatusMessage}" Margin="0,5,0,5" TextWrapping="Wrap"/>
+
+        <ProgressBar Grid.Row="4" Value="{Binding CurrentProgressPercentage}" Minimum="0" Maximum="100" Height="20" Margin="0,5,0,10"
+                     Visibility="{Binding IsGenerating, Converter={StaticResource BooleanToVisibilityConverter}}"/>
+
+    </Grid>
+</Window>
